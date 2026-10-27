@@ -6,7 +6,7 @@
 [English](README.en.md) · 中文
 
 
-把 抖音 / 小红书 / TikTok / **B 站** / **X (Twitter)** 的公开视频或图文链接，自动解析并以 QQ **合并转发**发回原聊天。
+把 抖音 / 小红书 / TikTok / **B 站** / **X (Twitter)** / **Instagram** / **Facebook** 的公开视频或图文链接，自动解析并以 QQ **合并转发**发回原聊天。
 为 [NekroAgent](https://github.com/KroMiose/nekro-agent) + OneBot v11 / NapCat 设计，附带一个可选的
 **本地解析器（media-resolver）**，用来处理机房 IP 拿不到的抖音/小红书直链，以及必须走代理的 TikTok；
 B 站不需要解析器 —— 云端直连公开 API 即可（支持 1080p / 4K，见下文）。
@@ -27,6 +27,8 @@ B 站不需要解析器 —— 云端直连公开 API 即可（支持 1080p / 4K
 | TikTok | ✅ | — | 解析器**经代理**下载到本机，再把文件交给 NapCat |
 | B站 | ✅ | — | 走 B 站公开 API 取**单文件 mp4** 直链，云端直接下载（**不需要解析器、不需要 ffmpeg**） |
 | X (Twitter) | ✅（含动图） | ✅ | 读 X 嵌入组件的**公开数据接口**，**不需要登录 / API token / 解析器**；合并转发里附带帖子文字（作者、北京时间、正文、被引用帖子）。纯文字帖也能发 |
+| Instagram | ✅（Reel / 视频帖） | ✅（单图 / 轮播） | 匿名读公开帖子页，**不登录、不用 Cookie / token、不需要解析器**；合并转发里附带作者、北京时间、点赞 / 评论数和正文。**非官方接口，可能随时失效**；不支持 Stories、私密账号 |
+| Facebook | ✅ | ✅（单图 / 相册） | 匿名读公开帖子页，**不登录、不用 Cookie / token、不需要解析器**；附带作者、北京时间、反应 / 评论 / 分享数和正文。**非官方接口，可能随时失效**；不支持 `fb.watch` 短链、群组帖、私密内容 |
 
 
 - 视频以**合并转发**发出（一条卡片，附原链接）
@@ -66,6 +68,16 @@ B 站不需要解析器 —— 云端直连公开 API 即可（支持 1080p / 4K
   **限制**：该接口不是 X 官方承诺的 API，字段 / 限流可能随时变化；只能读**公开的单条帖子**，受保护账号、已删除、
   敏感内容或需登录的帖子无法解析；长文（note tweet）只能拿到开头部分；暂不支持 `t.co` 短链和被引用帖子里的图片 / 视频。
   接口暂时不可用（限流 / 网络）时会回退 yt-dlp（只能发视频、没有文字）。详见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) 第 9 条。
+- Instagram / Facebook：两者都**不登录、不用 Cookie / token**，插件默认以诚实的 `nekro-media-forward/1.0` User-Agent 匿名请求公开帖子页并解析页面里内嵌的 JSON（Instagram 仅在诚实 UA 失败时才会按下面的开关回退 Googlebot UA）
+  （Instagram 的 SSR 数据、Facebook 的 Relay 数据），都是**非官方接口，页面结构 / 限流 / 是否开放可能随时变化**。
+  - Instagram：支持 `/p/` `/reel/` `/reels/` `/tv/` 和 `/<用户>/p/<code>/`（可带 `?igsh=`）。页面拿不到时依次回退 embed 页、yt-dlp（仅视频）、oEmbed（只有文字 + 缩略图）。
+    轮播取每张的全尺寸图；**图片和视频混合的轮播会先发所有图片再发视频，原有顺序不保留**。
+    Stories、私密账号、需登录的内容会提示无法解析。`instagram_fallback_ua` 是**灰色做法（伪装成搜索引擎爬虫的 UA）、默认开启**：只有诚实 UA 拿不到数据（页面是壳）时才会再用 Googlebot UA 重试一次；介意的话设为 `false` 关闭。
+  - Facebook：支持 `/<主页>/posts/<id>`、`/<主页>/videos/<id>`、`/reel/<id>`、`/watch/?v=`、`/share/p|v|r/<码>`（会还原成真实帖子地址）、`photo.php?fbid=`、`permalink.php?story_fbid=`（后两种匿名通常会被带去登录页，只能尽力回退）。
+    视频优先取 `plugins/video.php` 给出的**单文件 mp4（H.264 + AAC）**；拿不到时用页面里的 DASH 视频流 + 音频流，**用 ffmpeg 合并**（和 B 站同一个 ffmpeg，见 `bilibili_ffmpeg_path`；只有这条回退路径需要 ffmpeg）。
+    单张图片会去掉 CDN 链接里的 `ctp` 缩略图参数以取原图，失败再用原链接。`fb.watch` 短链、群组帖、`m.facebook.com` 的 `photo.php` 等需登录的内容不支持，会给出明确提示。
+  - 代理：配置 `instagram_proxy` / `facebook_proxy`（做法同 `x_proxy`，留空 = 直连）后，对应站点的帖子页请求、图片 / 视频下载和 yt-dlp 回退都走该代理；两项互相独立，不会借用 `x_proxy`。
+  - 通用：签名的 CDN 链接很快过期，所以解析后**立即下载**；中国大陆 IP 访问这两个站**未测试**，经代理访问也只做了离线的参数传递验证、没有真实代理实测（以上都是在海外服务器直连验证的）。详见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) 第 10 条。
 - B 站：机房 IP 访问网页会被风控（HTTP 412），所以改走 `api.bilibili.com` 的公开接口
   （`view` 拿 cid + `playurl` 的 `fnval=1` 直接返回单文件 mp4），因此 **B 站不需要本地解析器**；
   未登录时 B 站只给到 720p，番剧/课程需要登录 Cookie（会给出明确提示）
@@ -173,6 +185,14 @@ TikTok 这类"由解析器在本机下好文件"的平台，交付方式取决�
 | `x_send_text` | `true` | 合并转发里在图片 / 视频前附上作者、北京时间、正文和被引用帖子；关闭后只发媒体（纯文字帖会提示无内容） |
 | `x_proxy` | `""` | X 走代理的地址（大陆机房必填，如 `http://172.18.0.1:7891`） |
 | `x_show_stats` | `true` | 文字里是否带点赞 / 回复数 |
+| `instagram_enabled` | `true` | 是否解析 Instagram 帖子（匿名公开页，无需登录 / 解析器）；关闭后 Instagram 链接被忽略 |
+| `instagram_max_size_mb` | `100` | Instagram 视频体积上限（MB），超限则不发并提示实际大小 |
+| `instagram_fallback_ua` | `true` | **灰色做法（伪装爬虫 UA），默认开启，可设为 `false` 关闭**：先用诚实 UA，只有它拿不到数据时才再用 Googlebot UA 重试一次 |
+| `instagram_proxy` | `""` | Instagram 走代理的地址（帖子页 / 媒体下载 / yt-dlp 回退；留空 = 直连，如 `http://172.18.0.1:7891`） |
+| `facebook_proxy` | `""` | Facebook 走代理的地址（同上，两者互相独立） |
+| `facebook_enabled` | `true` | 是否解析 Facebook 帖子（匿名公开页，无需登录 / 解析器）；关闭后 Facebook 链接被忽略 |
+| `facebook_max_size_mb` | `100` | Facebook 视频体积上限（MB），超限则不发并提示实际大小 |
+| `facebook_send_comments` | `false` | 文字里是否附最多 5 条页面上匿名可见的热门评论 |
 | `allow_resolver_local_path` | `false` | NapCat 与解析器同机时设为 `true` |
 | `forward_nickname` | `机器人` | 合并转发卡片里显示的昵称（发送者账号取自 `bot.self_id`） |
 

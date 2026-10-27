@@ -17,6 +17,10 @@
 
 X (Twitter) 和 B 站一样不需要本地解析器：读 X 嵌入组件用的公开 syndication 接口，
 无需登录、无需 API token，拿到正文 / 图片 / 视频直链后云端直接下载并以合并转发发出。
+
+Instagram 和 Facebook 同理：不登录、不带 cookie / token，默认用诚实的非浏览器 UA 匿名读公开帖子页里的
+服务端渲染数据（非官方接口，随时可能失效），解析出文字 + 图片组 / 视频后云端下载并合并转发。
+可通过 instagram_proxy / facebook_proxy 走代理（做法同 x_proxy，留空 = 直连）。
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ import mimetypes
 import os
 import re
 import hashlib
+import json
 import secrets
 import shutil
 import time
@@ -36,7 +41,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
+from xml.etree import ElementTree as ET
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -53,8 +59,8 @@ from nekro_agent.api.signal import MsgSignal
 plugin = NekroPlugin(
     name="短视频合并转发",
     module_name="video_forward",
-    description="收到公开的抖音 / 小红书 / TikTok / B站 / X 链接后，将视频或图文以 QQ 合并转发发回原聊天。抖音与小红书由本地解析器取直链，B站走公开 API，X 读公开嵌入数据接口（含帖子文字）。",
-    version="0.10.0",
+    description="收到公开的抖音 / 小红书 / TikTok / B站 / X / Instagram / Facebook 链接后，将视频或图文以 QQ 合并转发发回原聊天。抖音与小红书由本地解析器取直链，B站走公开 API，X 读公开嵌入数据接口（含帖子文字），Instagram / Facebook 匿名读公开帖子页（不登录，非官方接口）。",
+    version="0.11.0",
     author="local_video",
     url="https://github.com/KroMiose/nekro-agent",
     support_adapter=["onebot_v11"],
@@ -222,6 +228,69 @@ class VideoForwardConfig(ConfigBase):
         title="X 帖子文字里显示点赞 / 回复数",
         description="只在「X 帖子同时发送文字」打开时有效。",
     )
+    instagram_enabled: bool = Field(
+        default=True,
+        title="启用 Instagram 帖子解析",
+        description=(
+            "收到 instagram.com 的 /p/ /reel/ /reels/ /tv/ 链接时，解析文字、图片和视频并合并转发。"
+            "不登录、不带 cookie / token，用非浏览器 UA 匿名读公开帖子页（非官方接口，随时可能失效）；"
+            "只能读公开帖子，私密 / 已删除 / Stories 会提示无法解析。关闭后 Instagram 链接会被忽略。"
+        ),
+    )
+    instagram_max_size_mb: int = Field(
+        default=100,
+        ge=5,
+        le=500,
+        title="Instagram 视频体积上限（MB）",
+        description="超过上限的视频不发送，并提示实际大小。默认 100MB。",
+    )
+    instagram_fallback_ua: bool = Field(
+        default=True,
+        title="Instagram 拿不到数据时改用 Googlebot UA 重试（灰色做法，默认开启，可关闭）",
+        description=(
+            "总是先用诚实的非浏览器 UA 请求；只有它拿不到数据（Instagram 偶尔只返回空壳）时，才会再用 Googlebot 的 UA 请求一次。"
+            "这是冒充搜索引擎爬虫的灰色做法，可能违反 Meta 的服务条款，也可能随时被封。默认开启；不想用就设为 false 关闭。"
+        ),
+    )
+    facebook_enabled: bool = Field(
+        default=True,
+        title="启用 Facebook 帖子解析",
+        description=(
+            "收到 facebook.com / fb.com 的公开帖子、视频、Reel、照片链接时，解析文字、图片和视频并合并转发。"
+            "不登录、不带 cookie / token，用非浏览器 UA 匿名读公开帖子页（非官方接口，随时可能失效）；"
+            "私密 / 群组 / 需要登录的内容会提示无法解析，fb.watch 短链暂不支持。关闭后 Facebook 链接会被忽略。"
+        ),
+    )
+    facebook_max_size_mb: int = Field(
+        default=100,
+        ge=5,
+        le=500,
+        title="Facebook 视频体积上限（MB）",
+        description="超过上限的视频不发送，并提示实际大小。默认 100MB。",
+    )
+    facebook_send_comments: bool = Field(
+        default=False,
+        title="Facebook 帖子文字里附上前几条评论",
+        description="打开后在帖子文字末尾附上页面里能匿名读到的前 5 条评论（作者 + 内容）。默认关闭。",
+    )
+    instagram_proxy: str = Field(
+        default="",
+        title="Instagram 代理（可选）",
+        description=(
+            "Instagram 的帖子页请求、媒体下载（以及 yt-dlp 回退）走这个代理。"
+            "填形如 http://172.18.0.1:7891 的地址（容器里的 127.0.0.1 是容器自己，要用宿主机网关 IP）。"
+            "留空 = 直连。大陆机房访问 Instagram 通常需要配置（未经测试）。"
+        ),
+    )
+    facebook_proxy: str = Field(
+        default="",
+        title="Facebook 代理（可选）",
+        description=(
+            "Facebook 的帖子页请求、媒体下载（以及 yt-dlp 回退）走这个代理。"
+            "填形如 http://172.18.0.1:7891 的地址（容器里的 127.0.0.1 是容器自己，要用宿主机网关 IP）。"
+            "留空 = 直连。大陆机房访问 Facebook 通常需要配置（未经测试）。"
+        ),
+    )
     bilibili_ffmpeg_path: str = Field(
         default="",
         title="B站 ffmpeg 路径（可选）",
@@ -269,6 +338,8 @@ _DOWNLOAD_REFERER = {
     "tiktok": "https://www.tiktok.com/",
     "bilibili": "https://www.bilibili.com/",
     "x": "https://x.com/",
+    "instagram": "https://www.instagram.com/",
+    "facebook": "https://www.facebook.com/",
 }
 # QQ 分享文案有时会把短链和标题拆成不同消息段，甚至省去 https://。
 # 因此只找受支持站点，而不是依赖整段消息恰好是一个标准 URL。
@@ -280,7 +351,11 @@ _URL_RE = re.compile(
     # 前面不能紧挨字母数字，否则 box.com 之类会被当成 x.com
     r"|(?<![A-Za-z0-9_.@/-])(?:https?://)?(?:[a-z0-9-]+\.)*"
     r"(?:x|twitter|fxtwitter|vxtwitter|fixupx|fixvx)\.com/"
-    r"(?:i/(?:web/)?|[A-Za-z0-9_]{1,50}/)status(?:es)?/\d+[^\s<>'\"，。！？、]*)",
+    r"(?:i/(?:web/)?|[A-Za-z0-9_]{1,50}/)status(?:es)?/\d+[^\s<>'\"，。！？、]*"
+    # Instagram / Facebook：这里只粗匹配「域名 + 路径」，是不是帖子链接由 _instagram_ref / _facebook_ref 决定
+    # （首页、个人主页、l.instagram.com 跳转链接等都会在那里被丢掉）；同样不能紧挨字母数字
+    r"|(?<![A-Za-z0-9_.@/-])(?:https?://)?(?:[a-z0-9-]+\.)*"
+    r"(?:instagram\.com|facebook\.com|fb\.com|fb\.watch)/[^\s<>'\"，。！？、]*)",
     re.IGNORECASE,
 )
 _VIDEO_DIR = Path("/tmp/nekro-video-forward")
@@ -294,7 +369,15 @@ _DOWNLOAD_UA = (
 )
 
 
-_PLATFORM_NAMES = {"douyin": "抖音", "xiaohongshu": "小红书", "tiktok": "TikTok", "bilibili": "B站", "x": "X"}
+_PLATFORM_NAMES = {
+    "douyin": "抖音",
+    "xiaohongshu": "小红书",
+    "tiktok": "TikTok",
+    "bilibili": "B站",
+    "x": "X",
+    "instagram": "Instagram",
+    "facebook": "Facebook",
+}
 
 
 @dataclass
@@ -315,6 +398,10 @@ class _MediaSource:
     images: tuple = ()
     # 放在媒体前面的文字节点（X 帖子正文等）；为空则用默认的「平台 + 视频/图文 + 链接」。
     caption: str = ""
+    # 签名 / 缩放参数导致主图链接失败时的备用链接（Instagram / Facebook）：{主链接: 备用链接}
+    image_fallbacks: Optional[Dict[str, str]] = None
+    # 同一条帖子里的其它视频（Instagram 轮播 / Facebook 相册）：((文件路径, 文件名), ...)，主视频仍是 path
+    extra_videos: tuple = ()
 
 
 @dataclass
@@ -432,6 +519,14 @@ def _find_supported_url(text: str) -> Optional[str]:
             if _x_status_id(url) and _x_enabled():
                 return url
             continue
+        if _is_instagram(url):
+            if _instagram_ref(url) and _meta_enabled("instagram_enabled"):
+                return url
+            continue
+        if _is_facebook(url):
+            if _facebook_ref(url) and _meta_enabled("facebook_enabled"):
+                return url
+            continue
         if any(host == domain or host.endswith("." + domain) for domain in _SUPPORTED_DOMAINS):
             return url
     return None
@@ -468,7 +563,18 @@ def _platform_of(url: str) -> Optional[str]:
 
 def _download_platform(url: str) -> Optional[str]:
     """下载图片 / 视频时用来挑 Referer 的平台键：本地解析器平台 + X（X 不走解析器，所以 _platform_of 里没有它）。"""
-    return "x" if _is_x(url) else _platform_of(url)
+    if _is_x(url):
+        return "x"
+    if _is_instagram(url):
+        return "instagram"
+    if _is_facebook(url):
+        return "facebook"
+    return _platform_of(url)
+
+
+def _download_ua(platform: Optional[str]) -> str:
+    """下载直链用的 UA：Instagram / Facebook 用诚实的非浏览器 UA（浏览器 UA 反而会被拦），其它平台不变。"""
+    return _META_UA if platform in ("instagram", "facebook") else _DOWNLOAD_UA
 
 
 def _needs_local_resolver(url: str) -> bool:
@@ -487,6 +593,10 @@ def _source_name(url: str) -> str:
         return "B站"
     if _is_x(url):
         return "X"
+    if _is_instagram(url):
+        return "Instagram"
+    if _is_facebook(url):
+        return "Facebook"
     return "未知平台"
 
 
@@ -607,7 +717,7 @@ async def _download_direct(
     return target
 
 
-async def _run_ytdlp(url: str, task_dir: Path) -> tuple[Path, str]:
+async def _run_ytdlp(url: str, task_dir: Path, proxy: Optional[str] = None) -> tuple[Path, str]:
     """用 yt-dlp 下载（小红书兜底；X 的公开接口不可用时也回退到这里）。"""
     binary = (plugin.get_config().yt_dlp_path or "yt-dlp").strip()
     if not binary or ("/" not in binary and "\\" not in binary and not shutil.which(binary)):
@@ -631,6 +741,8 @@ async def _run_ytdlp(url: str, task_dir: Path) -> tuple[Path, str]:
         str(output),
         url,
     ]
+    if proxy:
+        command[1:1] = ["--proxy", proxy]
     process = await asyncio.create_subprocess_exec(
         *command,
         stdout=asyncio.subprocess.PIPE,
@@ -1101,11 +1213,31 @@ _X_HOSTS = ("x.com", "twitter.com", "twimg.com", "t.co", "fxtwitter.com", "vxtwi
 
 
 def _proxy_for_url(url: str) -> Optional[str]:
-    """X/Twitter 相关域名的下载自动走代理；其它平台保持直连。"""
+    """X/Twitter、Instagram、Facebook 相关域名的请求 / 下载按各自的代理配置走代理；其它平台保持直连。
+    fbcdn.net 这类两家都可能用的 CDN 域名不在这里按域名判断，下载媒体的调用点按平台显式传入代理（见 _meta_proxy）。"""
     host = (_host_of(url) or "").lower()
     if any(host == h or host.endswith("." + h) for h in _X_HOSTS):
         return _x_proxy()
+    if any(host == h or host.endswith("." + h) for h in _IG_HOSTS):
+        return _meta_proxy("instagram")
+    if any(host == h or host.endswith("." + h) for h in _FB_HOSTS):
+        return _meta_proxy("facebook")
     return None
+
+
+def _meta_proxy(platform: Optional[str]) -> Optional[str]:
+    """Instagram / Facebook 专用代理（做法同 x_proxy：配置里留空 = 直连，不影响其它平台）。"""
+    if platform not in ("instagram", "facebook"):
+        return None
+    try:
+        value = str(getattr(plugin.get_config(), f"{platform}_proxy", "") or "").strip()
+    except Exception:  # noqa: BLE001 - 读不到配置时按直连
+        return None
+    return value or None
+
+
+_IG_HOSTS = ("instagram.com", "cdninstagram.com")
+_FB_HOSTS = ("facebook.com", "fb.com", "fb.watch")  # fbcdn.net 两家都可能用，下载时按平台显式传代理
 
 
 def _x_enabled() -> bool:
@@ -1529,6 +1661,1206 @@ async def _obtain_x(url: str, task_dir: Path) -> "_MediaSource":
 
 
 
+# ---------------------------------------------------------------- Instagram / Facebook（Meta）
+# 两个平台都**不登录、不带 cookie / token**，只读公开帖子，和 X、B 站一样不需要本地解析器：
+#
+# * 实测（2026-10-27，单一东京出口）：用**诚实的非浏览器 UA** + ``Accept: text/html`` 匿名 GET 公开帖子页，
+#   Meta 会返回服务端渲染（SSR）的页面，里面直接带着作者 / 全文 / 发布时间 / 点赞评论数 / 全部图片 / 视频直链；
+#   反而是浏览器 UA 会被 Instagram 给 JS 空壳、被 Facebook 直接 400。所以这里**不伪装浏览器**。
+# * 这些都是网页的内部数据，**不是官方 API**，字段和行为随时可能变；也可能违反 Meta 的服务条款，请自行评估，
+#   只建议个人 bot、低频、只读公开内容。国内 IP / 机房 IP / 高频请求的表现未测。
+# * 带签名的 CDN 直链会过期（oe= 参数），所以解析完要马上下载。
+# * 唯一的灰色做法：Instagram 在诚实 UA 拿不到数据时，可选用 Googlebot UA 再试一次，
+#   由配置项 ``instagram_fallback_ua`` 控制，**默认开启**（可设为 false 关闭）；只有诚实 UA 失败时才会触发。
+#   Facebook 没有任何 UA 伪装。
+
+_META_UA = "nekro-media-forward/1.0 (+personal bot; non-browser)"
+_GOOGLEBOT_UA = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
+_META_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+_META_MAX_TEXT_CHARS = 2200
+_META_MAX_VIDEOS = 4  # 一条帖子（轮播 / 相册）里最多发送几个视频，避免合并转发过大
+_FB_MAX_COMMENTS = 5
+_IG_DOMAINS = ("instagram.com",)
+_FB_DOMAINS = ("facebook.com", "fb.com", "fb.watch")
+_IG_POST_RE = re.compile(r"^/(?:[A-Za-z0-9_.]{1,30}/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]{5,})", re.IGNORECASE)
+_IG_STORY_RE = re.compile(r"^/stories/", re.IGNORECASE)
+_FB_SEG = r"[^/?#\s]+"
+
+
+def _host_in(url: str, domains: tuple) -> bool:
+    value = str(url or "").strip()
+    if "://" not in value:
+        value = "https://" + value
+    host = _host_of(value).strip(".")
+    return any(host == domain or host.endswith("." + domain) for domain in domains)
+
+
+def _is_instagram(url: str) -> bool:
+    return _host_in(url, _IG_DOMAINS)
+
+
+def _is_facebook(url: str) -> bool:
+    return _host_in(url, _FB_DOMAINS)
+
+
+def _meta_enabled(name: str) -> bool:
+    try:
+        return bool(getattr(plugin.get_config(), name, True))
+    except Exception:  # noqa: BLE001 - 读不到配置时按默认启用
+        return True
+
+
+def _instagram_ref(url: str) -> Optional[Dict[str, str]]:
+    """认出 Instagram 帖子链接：/p/ /reel/ /reels/ /tv/（含 /<用户>/p/<code>/ 和 ?igsh= 之类的尾巴），
+    以及 /stories/（识别出来是为了给明确的中文报错）。首页、个人主页、/explore/ 等返回 None。"""
+    value = str(url or "").strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = "https://" + value
+    if not _is_instagram(value):
+        return None
+    path = urlparse(value).path or ""
+    if _IG_STORY_RE.match(path):
+        return {"kind": "story", "code": ""}
+    match = _IG_POST_RE.match(path)
+    if not match:
+        return None
+    segment = re.search(r"/(p|reel|reels|tv)/", path, re.IGNORECASE)
+    kind = (segment.group(1).lower() if segment else "p").replace("reels", "reel")
+    return {"kind": kind, "code": match.group(1)}
+
+
+def _instagram_shortcode(url: str) -> Optional[str]:
+    ref = _instagram_ref(url)
+    return ref["code"] if ref and ref["kind"] != "story" and ref["code"] else None
+
+
+def _facebook_ref(url: str) -> Optional[Dict[str, str]]:
+    """认出 Facebook 内容链接，返回 ``{"kind": ..., ...}``；认不出（首页、个人主页、登录页…）返回 None。
+
+    kind：post（/<页面>/posts/<id>）、video（/<页面>/videos/<id>、/video.php?v=）、reel、watch（/watch/?v=）、
+    photo（photo.php / photo/?fbid= / /<页面>/photos/…）、permalink（permalink.php / story.php）、
+    share（/share/p|v|r/<code>）、group（/groups/…，通常要登录）、fbwatch（fb.watch 短链）。
+    """
+    value = str(url or "").strip()
+    if not value:
+        return None
+    if "://" not in value:
+        value = "https://" + value
+    if not _is_facebook(value):
+        return None
+    parts = urlparse(value)
+    host = (parts.hostname or "").lower().strip(".")
+    path = parts.path or "/"
+    query = {key: values[0] for key, values in parse_qs(parts.query).items() if values}
+    if host == "fb.watch" or host.endswith(".fb.watch"):
+        code = path.strip("/")
+        return {"kind": "fbwatch", "code": code} if code and "/" not in code else None
+    match = re.match(r"^/share/(?:([pvr])/)?([A-Za-z0-9_-]{6,})/?$", path)
+    if match:
+        return {"kind": "share", "sub": match.group(1) or "", "code": match.group(2)}
+    if re.match(r"^/groups/[^/]+/(?:posts|permalink)/", path):
+        return {"kind": "group", "path": path}
+    match = re.match(r"^/reel/(\d+)", path)
+    if match:
+        return {"kind": "reel", "id": match.group(1)}
+    if re.match(r"^/watch/?$", path) and query.get("v", "").isdigit():
+        return {"kind": "watch", "id": query["v"]}
+    if path.rstrip("/") == "/video.php" and query.get("v", "").isdigit():
+        return {"kind": "video", "id": query["v"], "path": ""}
+    if path.rstrip("/") in ("/photo.php", "/photo") and query.get("fbid"):
+        return {"kind": "photo", "id": query["fbid"]}
+    if path.rstrip("/") in ("/permalink.php", "/story.php") and query.get("story_fbid"):
+        return {"kind": "permalink", "story_fbid": query["story_fbid"], "id": query.get("id", "")}
+    match = re.match(rf"^/({_FB_SEG})/posts/({_FB_SEG}(?:/{_FB_SEG})*)/?$", path)
+    if match and match.group(1) not in ("groups", "watch", "reel", "share"):
+        return {"kind": "post", "path": path.rstrip("/"), "id": match.group(2).rsplit("/", 1)[-1]}
+    match = re.match(rf"^/({_FB_SEG})/videos/(?:{_FB_SEG}/)*(\d+)/?$", path)
+    if match:
+        return {"kind": "video", "id": match.group(2), "path": path}
+    match = re.match(rf"^/({_FB_SEG})/(?:photos|reels)/(?:[^/]+/)*([A-Za-z0-9_-]+)/?$", path)
+    if match and match.group(1) not in ("groups", "watch", "reel", "share"):
+        return {"kind": "photo", "id": match.group(2), "path": path}
+    return None
+
+
+# ---------------------------------------------------------------- Meta 公共：取页面 / 工具
+
+
+def _meta_headers(ua: str, accept: str = _META_ACCEPT) -> Dict[str, str]:
+    return {"User-Agent": ua, "Accept": accept, "Accept-Language": "en-US,en;q=0.8"}
+
+
+def _meta_login_redirect(location: str) -> bool:
+    path = (urlparse(location).path or "").lower()
+    return path.startswith(("/login", "/checkpoint", "/accounts/login")) or path.endswith("login.php")
+
+
+def _fb_rewrite_story_link(location: str) -> Optional[str]:
+    """story.php / permalink.php?story_fbid=X&id=Y（/share/p/ 短链的第一跳）→ /Y/posts/X，
+    这种形态匿名能直接拿到帖子页；原样跟下去会被带到登录页。"""
+    parts = urlparse(location)
+    if (parts.path or "").rstrip("/") not in ("/story.php", "/permalink.php"):
+        return None
+    query = {key: values[0] for key, values in parse_qs(parts.query).items() if values}
+    if query.get("story_fbid") and query.get("id"):
+        return f"https://www.facebook.com/{query['id']}/posts/{query['story_fbid']}"
+    return None
+
+
+async def _fetch_meta_html(
+    url: str,
+    ua: str = _META_UA,
+    accept: str = _META_ACCEPT,
+    timeout: float = 40.0,
+    attempts: int = 2,
+    max_hops: int = 5,
+) -> Dict[str, Any]:
+    """匿名取一个 Instagram / Facebook 页面（手动跟随跳转，不让它把我们带进登录页）。
+
+    返回 ``{"kind": ...}``：``ok``（带 text / url）、``login``（被重定向到登录页）、``missing``（404 / 410）、
+    ``retry``（429、5xx、网络错误、超时：暂时性失败，值得回退到别的路径）、``error``（其它 4xx / 异常跳转）。
+    """
+    current = url
+    last_error = "未知错误"
+    hops = 0
+    while hops <= max_hops:
+        response = None
+        for attempt in range(max(1, attempts)):
+            if attempt:
+                await asyncio.sleep(1.5 * attempt)
+            try:
+                meta_kwargs: Dict[str, Any] = {
+                    "headers": _meta_headers(ua, accept),
+                    "timeout": httpx.Timeout(timeout),
+                    "follow_redirects": False,
+                }
+                page_proxy = _proxy_for_url(current)
+                if page_proxy:
+                    meta_kwargs["proxy"] = page_proxy
+                async with httpx.AsyncClient(**meta_kwargs) as client:
+                    response = await client.get(current)
+            except httpx.HTTPError as error:
+                last_error = f"网络错误 {type(error).__name__}"
+                response = None
+                continue
+            if response.status_code == 429 or response.status_code >= 500:
+                last_error = f"HTTP {response.status_code}"
+                response = None
+                continue
+            if response.status_code == 200 and not response.content.strip():
+                last_error = "空响应"  # Facebook 偶尔对同一个页面返回 200 + 空正文，重试一次通常就好
+                response = None
+                continue
+            break
+        if response is None:
+            return {"kind": "retry", "error": last_error, "url": current}
+        status = response.status_code
+        if status in (301, 302, 303, 307, 308):
+            location = urljoin(current, response.headers.get("location", ""))
+            if not location or _meta_login_redirect(location):
+                return {"kind": "login", "url": current, "status": status}
+            rewritten = _fb_rewrite_story_link(location)
+            if rewritten:
+                location = rewritten
+            host = (urlparse(location).hostname or "").lower()
+            if not (_host_in(location, _FB_DOMAINS + _IG_DOMAINS)) or host.endswith("fb.watch"):
+                return {"kind": "error", "error": f"异常跳转到 {host or '未知地址'}", "url": current}
+            current = location
+            hops += 1
+            continue
+        if status in (404, 410):
+            return {"kind": "missing", "status": status, "url": current}
+        if status in (401, 403):
+            return {"kind": "login", "status": status, "url": current}
+        if status != 200:
+            return {"kind": "error", "error": f"HTTP {status}", "status": status, "url": current}
+        return {"kind": "ok", "text": response.text, "url": current, "status": status}
+    return {"kind": "error", "error": "跳转次数过多", "url": current}
+
+
+def _meta_json_blocks(page: str) -> List[Any]:
+    """页面里 ``<script type="application/json" ... data-sjs>`` 的 JSON 块（Relay 预取数据）。"""
+    blocks: List[Any] = []
+    for match in re.finditer(r'<script type="application/json"[^>]*data-sjs[^>]*>(.*?)</script>', page, re.S):
+        try:
+            blocks.append(json.loads(match.group(1)))
+        except ValueError:
+            continue
+    return blocks
+
+
+def _meta_walk(obj: Any, path: tuple = ()):
+    """深度优先遍历 JSON，产出 (路径, 节点)。"""
+    yield path, obj
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            yield from _meta_walk(value, path + (key,))
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            yield from _meta_walk(value, path + (index,))
+
+
+def _meta_og(page: str, prop: str) -> Optional[str]:
+    match = re.search(r'<meta[^>]+property="%s"[^>]+content="([^"]*)"' % re.escape(prop), page)
+    return html.unescape(match.group(1)) if match else None
+
+
+def _meta_utc_iso(timestamp: Any) -> Optional[str]:
+    try:
+        return datetime.fromtimestamp(int(timestamp), timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _meta_sniff_ext(data: bytes) -> str:
+    """按文件头判断图片扩展名（CDN 有时给 webp / png，不能一律当 jpg）。"""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    return ".jpg"
+
+
+def _meta_trim(text: str) -> str:
+    text = str(text or "").strip()
+    return text[:_META_MAX_TEXT_CHARS] + "…" if len(text) > _META_MAX_TEXT_CHARS else text
+
+
+def _meta_post_kind(resolved: Dict[str, Any], picked_images: int) -> str:
+    videos = len(resolved.get("videos") or [])
+    images = len(resolved.get("image_list") or [])
+    if videos and images:
+        return f"图文 + 视频（{picked_images} 张图 + {videos} 个视频）"
+    if videos:
+        return "视频" if videos == 1 else f"视频（{videos} 个）"
+    if images:
+        return f"图文（{picked_images} 张）"
+    return "纯文字"
+
+
+# ---------------------------------------------------------------- Instagram
+
+
+def _ig_find_media(page: str, code: str) -> Optional[Dict[str, Any]]:
+    """从页面 SSR 数据里找帖子节点：``xig_polaris_media.if_not_gated_logged_out``（带 taken_at 和 code）。
+    ``if_not_gated_logged_out`` 为 null 说明这条帖子匿名看不到（私密 / 受限）。"""
+    for block in re.findall(r'<script type="application/json"[^>]*data-sjs[^>]*>(.*?)</script>', page, re.S):
+        if "if_not_gated_logged_out" not in block:
+            continue
+        try:
+            data = json.loads(block)
+        except ValueError:
+            continue
+        stack = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                if "taken_at" in node and "code" in node and (not code or node.get("code") == code):
+                    return node
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+    return None
+
+
+def _ig_page_item(node: Dict[str, Any]) -> Dict[str, Any]:
+    versions = ((node.get("image_versions2") or {}).get("candidates")) or []
+    # candidates[0] 没有 stp 尺寸限制，就是原图（实测 1080~4096px）；display_uri 是 640px 的备用
+    image = str(versions[0].get("url")) if versions and versions[0].get("url") else str(node.get("display_uri") or "")
+    fallback = str(node.get("display_uri") or "")
+    video_versions = [item for item in (node.get("video_versions") or []) if isinstance(item, dict) and item.get("url")]
+    width, height = node.get("original_width"), node.get("original_height")
+    item: Dict[str, Any] = {
+        "type": "video" if (node.get("media_type") == 2 or video_versions) else "image",
+        "image_url": image,
+        "image_fallback": fallback if fallback and fallback != image else "",
+        "width": width,
+        "height": height,
+    }
+    if video_versions:
+        item["video_url"] = str(video_versions[0]["url"])
+    return item
+
+
+def _ig_post_from_page(node: Dict[str, Any]) -> Dict[str, Any]:
+    kids = [item for item in (node.get("carousel_media") or []) if isinstance(item, dict)] or [node]
+    user = node.get("user") or {}
+    return {
+        "source": "page",
+        "shortcode": node.get("code"),
+        "product_type": node.get("product_type"),
+        "username": str(user.get("username") or ""),
+        "full_name": str(user.get("full_name") or ""),
+        "caption": str((node.get("caption") or {}).get("text") or ""),
+        "likes": node.get("like_count"),
+        "comments": node.get("comment_count"),
+        "taken_at": node.get("taken_at"),
+        "items": [_ig_page_item(kid) for kid in kids],
+    }
+
+
+def _ig_post_from_embed(page: str) -> Optional[Dict[str, Any]]:
+    """备用：``/p/<code>/embed/captioned/`` 的 contextJSON → gql_data.shortcode_media。
+    轮播 / 视频可用；单图帖这里是 null；没有发布时间。"""
+    match = re.search(r'"contextJSON":"((?:[^"\\]|\\.)*)"', page)
+    if not match:
+        return None
+    try:
+        context = json.loads(json.loads('"' + match.group(1) + '"'))
+        media = context["gql_data"]["shortcode_media"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(media, dict):
+        return None
+    edges = (media.get("edge_media_to_caption") or {}).get("edges") or [{}]
+    kids = [edge["node"] for edge in (media.get("edge_sidecar_to_children") or {}).get("edges", []) if edge.get("node")] or [media]
+    items = []
+    for kid in kids:
+        resources = kid.get("display_resources") or []
+        if resources:
+            best = max(resources, key=lambda res: int(res.get("config_width") or 0) * int(res.get("config_height") or 0))
+            image, width, height = best.get("src"), best.get("config_width"), best.get("config_height")
+        else:
+            dims = kid.get("dimensions") or {}
+            image, width, height = kid.get("display_url"), dims.get("width"), dims.get("height")
+        item: Dict[str, Any] = {
+            "type": "video" if kid.get("is_video") else "image",
+            "image_url": str(image or ""),
+            "image_fallback": "",
+            "width": width,
+            "height": height,
+        }
+        if kid.get("is_video") and kid.get("video_url"):
+            item["video_url"] = str(kid["video_url"])
+        items.append(item)
+    owner = media.get("owner") or {}
+    return {
+        "source": "embed",
+        "shortcode": media.get("shortcode"),
+        "product_type": media.get("product_type"),
+        "username": str(owner.get("username") or ""),
+        "full_name": str(owner.get("full_name") or ""),
+        "caption": str((edges[0].get("node") or {}).get("text") or ""),
+        "likes": (media.get("edge_liked_by") or {}).get("count"),
+        "comments": (media.get("edge_media_to_comment") or {}).get("count"),
+        "taken_at": media.get("taken_at_timestamp"),
+        "items": items,
+    }
+
+
+def _ig_build_resolved(post: Dict[str, Any], code: str, kind: str) -> Dict[str, Any]:
+    items = post.get("items") or []
+    image_list: List[str] = []
+    fallbacks: Dict[str, str] = {}
+    videos: List[Dict[str, Any]] = []
+    cover: Optional[str] = None
+    for item in items:
+        if item.get("image_url"):
+            cover = cover or item["image_url"]
+        if item.get("type") == "video" and item.get("video_url"):
+            width, height = item.get("width"), item.get("height")
+            videos.append({
+                "label": f"{width}x{height}" if width and height else "mp4",
+                "url": item["video_url"],
+                "size": None,
+                "width": width,
+                "height": height,
+            })
+        elif item.get("type") == "image" and item.get("image_url"):
+            image_list.append(item["image_url"])
+            if item.get("image_fallback"):
+                fallbacks[item["image_url"]] = item["image_fallback"]
+    shown_kind = "reel" if (post.get("product_type") == "clips" or kind in ("reel", "tv")) else "p"
+    created = _meta_utc_iso(post.get("taken_at"))
+    return {
+        "ok": True,
+        "platform": "instagram",
+        "mode": "direct_url",
+        "source": post.get("source"),
+        "note_id": code,
+        "title": str(post.get("caption") or "").strip(),
+        "author": post.get("full_name") or post.get("username") or "",
+        "screen_name": post.get("username") or "",
+        "created_at": created,
+        "created_at_beijing": _x_beijing_time(created) if created else "",
+        "likes": post.get("likes"),
+        "replies": post.get("comments"),
+        "canonical_url": f"https://www.instagram.com/{shown_kind}/{code}/",
+        "media_count": len(items),
+        "cover": cover,
+        "videos": videos,
+        "image_list": image_list,
+        "image_fallbacks": fallbacks,
+    }
+
+
+async def _ig_fetch_post(code: str) -> Dict[str, Any]:
+    """页面 SSR → （可选）Googlebot UA → embed。成功返回 ``{"post": {...}}``，失败返回 ``{"errors": [...]}``。"""
+    errors: List[str] = []
+    config = plugin.get_config()
+    agents = [(_META_UA, "page")]
+    if bool(getattr(config, "instagram_fallback_ua", True)):
+        agents.append((_GOOGLEBOT_UA, "page(Googlebot UA)"))
+    for ua, label in agents:
+        fetched = await _fetch_meta_html(f"https://www.instagram.com/p/{code}/", ua, timeout=30.0)
+        if fetched["kind"] == "ok":
+            node = await asyncio.to_thread(_ig_find_media, fetched["text"], code)
+            if node:
+                post = _ig_post_from_page(node)
+                post["source"] = label
+                return {"post": post}
+            errors.append(f"{label}：页面里没有帖子数据（只拿到 JS 空壳，或帖子需要登录）")
+            continue
+        errors.append(f"{label}：{fetched['kind']} {fetched.get('error') or fetched.get('status') or ''}".strip())
+        if fetched["kind"] == "login":
+            break  # 被带去登录页就不要再换 UA 硬试了
+    fetched = await _fetch_meta_html(f"https://www.instagram.com/p/{code}/embed/captioned/", _META_UA, timeout=30.0)
+    if fetched["kind"] == "ok":
+        post = await asyncio.to_thread(_ig_post_from_embed, fetched["text"])
+        if post:
+            return {"post": post}
+        errors.append("embed：没有 contextJSON（单图帖 / 私密 / 已删除 / 格式变了）")
+    else:
+        errors.append(f"embed：{fetched['kind']} {fetched.get('error') or fetched.get('status') or ''}".strip())
+    return {"errors": errors}
+
+
+async def _resolve_instagram(url: str) -> Dict[str, Any]:
+    """取 Instagram 帖子的作者 / 全文 / 时间 / 点赞评论数 / 全部图片 / 视频直链（匿名，不登录）。
+
+    ``ok=False`` 且带 ``fallback=True`` 表示页面和 embed 都没拿到数据，调用方可以继续 yt-dlp → oEmbed；
+    没有 ``fallback`` 的失败（Stories、认不出链接）是确定的。
+    """
+    ref = _instagram_ref(url)
+    if not ref:
+        return {"ok": False, "platform": "instagram", "error": f"没能从链接里认出 Instagram 帖子（链接：{str(url)[:100]}）。"}
+    if ref["kind"] == "story":
+        return {
+            "ok": False,
+            "platform": "instagram",
+            "error": "暂不支持 Instagram Stories：Stories 必须登录才能看，本插件不使用登录态。请发 /p/ 或 /reel/ 帖子链接。",
+        }
+    code = ref["code"]
+    fetched = await _ig_fetch_post(code)
+    post = fetched.get("post")
+    if not post:
+        return {
+            "ok": False,
+            "platform": "instagram",
+            "fallback": True,
+            "code": code,
+            "error": "Instagram 没有给出这条帖子的数据（" + "；".join(fetched.get("errors") or ["未知原因"]) + "）。",
+        }
+    resolved = _ig_build_resolved(post, code, ref["kind"])
+    if not resolved["videos"] and not resolved["image_list"] and not resolved["title"]:
+        return {"ok": False, "platform": "instagram", "fallback": True, "code": code, "error": "Instagram 返回的帖子里没有任何可用内容。"}
+    return resolved
+
+
+async def _ig_oembed(url: str) -> Dict[str, Any]:
+    """官方公开的 oEmbed 接口（不要 token 的那个网页端点）：只有文字 + 缩略图。
+    返回 ``{"kind": "ok", "data": {...}}`` / ``missing``（404：已删除、私密或不存在）/ ``error``。"""
+    endpoint = "https://www.instagram.com/api/v1/oembed/?url=" + quote(url, safe="")
+    fetched = await _fetch_meta_html(endpoint, _META_UA, accept="application/json,*/*;q=0.5", timeout=20.0)
+    if fetched["kind"] == "missing":
+        return {"kind": "missing"}
+    if fetched["kind"] != "ok":
+        return {"kind": "error", "error": f"{fetched['kind']} {fetched.get('error') or fetched.get('status') or ''}".strip()}
+    try:
+        data = json.loads(fetched["text"])
+    except ValueError:
+        return {"kind": "error", "error": "oEmbed 返回的不是 JSON"}
+    return {"kind": "ok", "data": data} if isinstance(data, dict) else {"kind": "error", "error": "oEmbed 返回格式异常"}
+
+
+def _format_ig_caption(resolved: Dict[str, Any], kind: str, picked_images: int = 0) -> str:
+    """合并转发里放在媒体前面的文字：作者 / 北京时间 / 点赞评论 / 全文 / 原链接。"""
+    author = str(resolved.get("author") or "").strip()
+    screen_name = str(resolved.get("screen_name") or "").strip()
+    who = f"{author} @{screen_name}" if author and screen_name and author != screen_name else (f"@{screen_name}" if screen_name else author)
+    when = str(resolved.get("created_at_beijing") or "")
+    meta = [part for part in (who, f"{when}（北京时间）" if when else "") if part]
+    lines = [f"Instagram 帖子 · {kind}"]
+    if meta:
+        lines.append(" · ".join(meta))
+    stats = []
+    if resolved.get("likes") is not None:
+        stats.append(f"点赞 {resolved['likes']}")
+    if resolved.get("replies") is not None:
+        stats.append(f"评论 {resolved['replies']}")
+    if stats:
+        lines.append(" · ".join(stats))
+    body = str(resolved.get("title") or "").strip()
+    if body:
+        lines.append("")
+        lines.append(_meta_trim(body))
+        if len(body) > _META_MAX_TEXT_CHARS:
+            lines.append("（正文过长，已截断，完整内容请看原帖）")
+    if resolved.get("note"):
+        lines.append("")
+        lines.append(str(resolved["note"]))
+    lines.append("")
+    lines.append(f"链接：{resolved.get('canonical_url') or ''}")
+    return "\n".join(lines)
+
+
+async def _obtain_instagram(url: str, task_dir: Path) -> "_MediaSource":
+    """Instagram 帖子 → 可发送内容。回退链：页面 SSR → embed（都在 _resolve_instagram 里）
+    → oEmbed 探测（404 = 已删除 / 私密，直接报错）→ yt-dlp（只能拿视频）→ oEmbed（只有文字 + 缩略图）。"""
+    config = plugin.get_config()
+    limit = int(getattr(config, "instagram_max_size_mb", 100) or 100) * 1024 * 1024
+    try:
+        resolved = await _resolve_instagram(url)
+    except Exception as error:  # noqa: BLE001 - 意外错误也走回退
+        plugin.logger.warning(f"Instagram 解析异常：{error}")
+        resolved = {"ok": False, "platform": "instagram", "fallback": True, "error": f"Instagram 解析失败：{error}"}
+
+    if resolved.get("ok"):
+        return await _obtain_meta_post(resolved, "instagram", task_dir, limit, _format_ig_caption)
+
+    message = str(resolved.get("error") or "Instagram 解析失败")
+    if not resolved.get("fallback"):
+        raise RuntimeError(message)
+    plugin.logger.warning(f"{message} 回退 oEmbed / yt-dlp")
+    canonical = f"https://www.instagram.com/p/{resolved.get('code')}/" if resolved.get("code") else url
+    oembed = await _ig_oembed(canonical)
+    if oembed["kind"] == "missing":
+        raise RuntimeError("没有找到这条 Instagram 帖子：可能已被删除、账号是私密的，或需要登录才能查看。")
+    text_post: Optional[Dict[str, Any]] = None
+    if oembed["kind"] == "ok":
+        data = oembed["data"]
+        text_post = {
+            "title": str(data.get("title") or "").strip(),
+            "author": str(data.get("author_name") or ""),
+            "screen_name": str(data.get("author_name") or ""),
+            "canonical_url": canonical,
+            "thumbnail": str(data.get("thumbnail_url") or ""),
+        }
+    try:
+        video, name = await _run_ytdlp(url, task_dir, _meta_proxy("instagram"))
+    except Exception as error:  # noqa: BLE001 - 图片帖 yt-dlp 本来就会失败，不是异常情况
+        plugin.logger.info(f"Instagram yt-dlp 回退没有拿到视频：{error}")
+        if not text_post:
+            raise RuntimeError(f"{message}yt-dlp 回退和 oEmbed 也都失败（{error}；oEmbed：{oembed.get('error')}）。") from error
+        text_post["note"] = "（Instagram 没有给出完整数据，只取到了文字和缩略图；完整内容请看原帖）"
+        caption = _format_ig_caption(text_post, "文字 + 缩略图")
+        source = _MediaSource(name=f"Instagram-{resolved.get('code') or int(time.time())}", caption=caption)
+        if text_post["thumbnail"]:
+            source.images = (text_post["thumbnail"],)
+        return source
+    caption = ""
+    if text_post:
+        text_post["note"] = "（视频由 yt-dlp 取得；点赞 / 时间等数据没有取到）"
+        caption = _format_ig_caption(text_post, "视频")
+    return _MediaSource(name=name, path=video, size=video.stat().st_size, caption=caption)
+
+
+# ---------------------------------------------------------------- Facebook
+
+
+def _fb_drop_ctp(url: str) -> Optional[str]:
+    """单图的 CDN 链接带 ``ctp=p600x600``（客户端目标尺寸），会把图压到 ~900px。
+    签名（oh=）并不覆盖 ctp，去掉它就是原图（实测 2048x1365）；去掉 stp/cstp 会 403，所以只去 ctp。
+    没有 ctp 参数时返回 None。这是改动 Meta 签发的 URL，属于「利用 URL 参数」，失败时调用方回退原 URL。"""
+    parts = urlsplit(url)
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    if not any(key == "ctp" for key, _ in pairs):
+        return None
+    return urlunsplit(parts._replace(query=urlencode([(key, value) for key, value in pairs if key != "ctp"])))
+
+
+def _fb_photo_item(media: Dict[str, Any]) -> Dict[str, Any]:
+    viewer = media.get("viewer_image") or {}
+    image = media.get("image") or {}
+    photo_image = media.get("photo_image") if isinstance(media.get("photo_image"), dict) else {}
+    uri = viewer.get("uri") or photo_image.get("uri") or image.get("uri")
+    return {
+        "type": "image",
+        "id": media.get("id"),
+        "url": uri,
+        "url_full": _fb_drop_ctp(uri) if uri else None,
+        "width": viewer.get("width") or image.get("width") or photo_image.get("width"),
+        "height": viewer.get("height") or image.get("height") or photo_image.get("height"),
+    }
+
+
+def _fb_best_dash(mpd: str) -> tuple:
+    """DASH 清单里挑 H.264(avc1) 码率最高的视频流 + 码率最高的音频流（QQ 对 H.264 + AAC 兼容最好）。"""
+    namespace = "{urn:mpeg:dash:schema:mpd:2011}"
+    try:
+        root = ET.fromstring(mpd)
+    except ET.ParseError:
+        return None, None
+    reps = []
+    for rep in root.iter(namespace + "Representation"):
+        base = rep.find(namespace + "BaseURL")
+        if base is None or not base.text:
+            continue
+        reps.append({
+            "kind": "v" if str(rep.get("mimeType") or "").startswith("video") else "a",
+            "bandwidth": int(rep.get("bandwidth") or 0),
+            "codecs": rep.get("codecs") or "",
+            "url": base.text,
+            "width": int(rep.get("width") or 0),
+            "height": int(rep.get("height") or 0),
+            "label": rep.get("FBQualityLabel"),
+        })
+    videos = [rep for rep in reps if rep["kind"] == "v" and rep["codecs"].startswith("avc1")] or [
+        rep for rep in reps if rep["kind"] == "v"
+    ]
+    audios = [rep for rep in reps if rep["kind"] == "a"]
+    best_video = max(videos, key=lambda rep: rep["bandwidth"]) if videos else None
+    best_audio = max(audios, key=lambda rep: rep["bandwidth"]) if audios else None
+    return best_video, best_audio
+
+
+def _fb_parse_page(page: str) -> Dict[str, Any]:
+    """解析 Facebook 帖子页里的 Relay 数据：作者 / 全文 / 时间 / 反应评论分享数 / 图片 / 视频 / 前几条评论。
+    找不到的字段留空（降级），不抛异常。视频只记 id 和 DASH 清单里挑出来的流（真正的下载链接在 _fb_video_sources）。"""
+    blocks = _meta_json_blocks(page)
+    result: Dict[str, Any] = {
+        "author": None, "author_id": None, "text": None, "created": None, "reactions": None, "comments": None,
+        "shares": None, "views": None, "items": [], "album_count": None, "link": None, "source": None,
+        "post_id": None, "permalink": None, "comments_sample": [],
+    }
+    story = None
+    for block in blocks:
+        for _path, node in _meta_walk(block):
+            if (
+                isinstance(node, dict)
+                and node.get("__typename") == "Story"
+                and "creation_time" in node
+                and isinstance(node.get("comet_sections"), dict)
+            ):
+                story = node
+                break
+        if story:
+            break
+    created = None
+    if story:
+        result["source"] = "relay:Story"
+        result["post_id"] = story.get("post_id")
+        result["permalink"] = story.get("permalink_url")
+        created = story.get("creation_time")
+        actor = (story.get("actors") or [{}])[0]
+        result["author"], result["author_id"] = actor.get("name"), actor.get("id")
+        sections = story.get("comet_sections")
+        for _path, node in _meta_walk(sections):
+            if isinstance(node, dict) and isinstance(node.get("message"), dict) and "text" in node["message"]:
+                result["text"] = node["message"]["text"]
+                break
+        for _path, node in _meta_walk(sections):
+            if isinstance(node, dict) and "i18n_reaction_count" in node and isinstance(node.get("reaction_count"), dict) and "share_count" in node:
+                result["reactions"] = node["reaction_count"].get("count")
+                result["shares"] = (node.get("share_count") or {}).get("count")
+                break
+        for _path, node in _meta_walk(sections):
+            if isinstance(node, dict) and isinstance(node.get("comments"), dict) and "total_count" in node["comments"]:
+                result["comments"] = node["comments"]["total_count"]
+                break
+        for attachment in story.get("attachments") or []:
+            style = ((attachment.get("styles") or {}).get("attachment")) or {}
+            subs = style.get("all_subattachments")
+            if isinstance(subs, dict) and subs.get("nodes"):
+                result["album_count"] = subs.get("count")
+                for sub in subs["nodes"]:
+                    media = sub.get("media") or {}
+                    if media.get("__typename") == "Photo":
+                        result["items"].append(_fb_photo_item(media))
+                    elif media.get("__typename") == "Video":
+                        result["items"].append({"type": "video", "id": media.get("id")})
+                continue
+            media = style.get("media") or {}
+            if media.get("__typename") == "Photo":
+                result["items"].append(_fb_photo_item(media))
+            elif media.get("__typename") == "Video":
+                result["items"].append({"type": "video", "id": media.get("id")})
+            if style.get("title") or style.get("url"):
+                source = style.get("source")
+                result["link"] = {
+                    "title": style.get("title"),
+                    "url": style.get("url") or attachment.get("url"),
+                    "domain": source.get("text") if isinstance(source, dict) else source,
+                }
+    # 视频 / Reel 页：data.video 是主视频；同页的相关视频不属于这条帖子
+    primary = None
+    for block in blocks:
+        for path, node in _meta_walk(block):
+            if path and path[-1] == "video" and isinstance(node, dict) and node.get("id") and ("creation_story" in node or "story" in node) and "result" in path:
+                primary = node["id"]
+                story_info = node.get("creation_story") or {}
+                created = created or story_info.get("creation_time")
+                result["post_id"] = result["post_id"] or primary
+                break
+        if primary:
+            break
+    if primary:
+        for block in blocks:
+            for _path, node in _meta_walk(block):
+                if isinstance(node, dict) and node.get("id") == primary and isinstance(node.get("publish_time"), int):
+                    created = node["publish_time"]
+                if isinstance(node, dict) and node.get("id") == primary and isinstance(node.get("creation_story"), dict):
+                    # 视频页里 creation_story.message.text 是完整正文（og:description 会被截断到 ~200 字）
+                    story_message = node["creation_story"].get("message")
+                    if not result["text"] and isinstance(story_message, dict) and story_message.get("text"):
+                        result["text"] = story_message["text"]
+                if isinstance(node, dict) and "play_count" in node and "video_view_count" in node:
+                    # play_count 就是页面上显示的「xx 次观看」；video_view_count 是另一个口径（更小）
+                    result["views"] = node.get("play_count") or node.get("video_view_count")
+    seen: set = set()
+    for block in blocks:
+        for _path, node in _meta_walk(block):
+            if not (isinstance(node, dict) and "dash_manifest_xml_string" in node and node.get("id") not in seen):
+                continue
+            known = any(item.get("id") == node.get("id") for item in result["items"])
+            if primary and node.get("id") != primary and not known:
+                continue  # 相关 / 下一个视频，不是这条帖子的
+            if story and not known and (result["items"] or seen):
+                continue  # 帖子页：只收这条帖子的附件视频
+            seen.add(node["id"])
+            best_video, best_audio = _fb_best_dash(node["dash_manifest_xml_string"])
+            entry = next((item for item in result["items"] if item["type"] == "video" and item.get("id") == node["id"]), None)
+            if entry is None:
+                entry = {"type": "video", "id": node["id"]}
+                result["items"].append(entry)
+            if best_video:
+                entry.update(
+                    dash_video_url=best_video["url"], dash_audio_url=best_audio["url"] if best_audio else None,
+                    width=best_video["width"], height=best_video["height"], label=best_video["label"],
+                )
+            result["source"] = result["source"] or "relay:video"
+    if result["source"] == "relay:video":
+        title = _meta_og(page, "og:title") or ""
+        parts = [part.strip() for part in title.split(" | ")]
+        if len(parts) >= 2 and re.search(r"views|reactions", parts[0]):
+            result["author"] = parts[-1] if len(parts) >= 3 else result["author"] or parts[-1]
+        for block in blocks:
+            for _path, node in _meta_walk(block):
+                if isinstance(node, dict) and isinstance(node.get("comments"), dict) and "total_count" in node["comments"] and result["comments"] is None:
+                    result["comments"] = node["comments"]["total_count"]
+                if isinstance(node, dict) and "i18n_reaction_count" in node and isinstance(node.get("reaction_count"), dict) and result["reactions"] is None:
+                    result["reactions"] = node["reaction_count"].get("count")
+                    result["shares"] = (node.get("share_count") or {}).get("count") if "share_count" in node else None
+    seen_comments: set = set()
+    for block in blocks:
+        for _path, node in _meta_walk(block):
+            if (
+                isinstance(node, dict) and isinstance(node.get("body"), dict) and node["body"].get("text")
+                and isinstance(node.get("author"), dict) and node.get("id") not in seen_comments and "created_time" in node
+            ):
+                seen_comments.add(node.get("id"))
+                result["comments_sample"].append({"author": node["author"].get("name"), "text": node["body"]["text"]})
+    result["comments_sample"] = result["comments_sample"][:_FB_MAX_COMMENTS]
+    result["created"] = _meta_utc_iso(created)
+    # og 标签兜底：全文被截断时至少有一点文字；没有任何附件时至少有首图
+    if not result["text"]:
+        result["text"] = _meta_og(page, "og:description")
+        if result["text"]:
+            result["text_truncated"] = True
+    if not result["author"]:
+        result["author"] = _meta_og(page, "og:title")
+    if not result["items"]:
+        og_image = _meta_og(page, "og:image")
+        if og_image:
+            result["items"].append({"type": "image", "url": og_image, "url_full": None, "note": "og:image"})
+        result["source"] = result["source"] or "og-only"
+    return result
+
+
+def _fb_parse_plugin_post(page: str) -> Dict[str, Any]:
+    """``/plugins/post.php``（嵌入组件）：文字 + 发布时间 + 反应评论分享数 + 前几条评论 + 小图（约 400px 级）。
+    比主页面差很多，只作为回退。"""
+    result: Dict[str, Any] = {
+        "author": None, "text": None, "created": None, "reactions": None, "comments": None, "shares": None,
+        "items": [], "comments_sample": [], "source": "plugins/post.php",
+    }
+    for match in re.finditer(r'<script type="application/ld\+json"[^>]*>(.*?)</script>', page, re.S):
+        try:
+            data = json.loads(match.group(1))
+        except ValueError:
+            continue
+        if not isinstance(data, dict) or data.get("@type") != "SocialMediaPosting":
+            continue
+        try:
+            result["created"] = datetime.strptime(str(data.get("dateCreated")), "%Y-%m-%dT%H:%M:%S%z").astimezone(timezone.utc).isoformat()
+        except ValueError:
+            pass
+        for stat in data.get("interactionStatistic") or []:
+            kind = str(stat.get("interactionType") or "")
+            if kind.endswith("CommentAction"):
+                result["comments"] = stat.get("userInteractionCount")
+            elif kind.endswith("LikeAction"):
+                result["reactions"] = stat.get("userInteractionCount")
+            elif kind.endswith("ShareAction"):
+                result["shares"] = stat.get("userInteractionCount")
+        for comment in data.get("comment") or []:
+            if isinstance(comment, dict) and comment.get("text"):
+                result["comments_sample"].append({"author": (comment.get("author") or {}).get("name"), "text": comment["text"]})
+        headline = str(data.get("headline") or "")
+        if " - " in headline:
+            result["author"] = headline.rsplit(" - ", 1)[-1].strip() or None
+        break
+    match = re.search(r'<div class="_2_79[^"]*">([^<]+)', page)
+    if match:
+        result["author"] = html.unescape(match.group(1)).strip() or result["author"]
+    match = re.search(r'data-testid="post_message"[^>]*>(.*?)</div>', page, re.S)
+    if match:
+        raw = re.sub(r"</p>\s*<p>", "\n\n", match.group(1))  # 段落之间空一行
+        raw = re.sub(r"<br\s*/?>", "\n", raw)
+        text = html.unescape(re.sub(r"<[^>]+>", "", raw))
+        result["text"] = re.sub(r"[ \t]*\n[ \t]*", "\n", text).strip() or None
+    for match in re.finditer(r'<img[^>]+class="[^"]*scaledImageFit[^"]*"[^>]+src="([^"]+)"', page):
+        result["items"].append({"type": "image", "url": html.unescape(match.group(1)), "url_full": None})
+    result["comments_sample"] = result["comments_sample"][:_FB_MAX_COMMENTS]
+    return result
+
+
+async def _fb_video_sources(video_id: str) -> Dict[str, Optional[str]]:
+    """``/plugins/video.php``：嵌入播放器页，里面直接给单文件 H.264 + AAC 的 mp4（hd_src 720p / sd_src 360p），
+    不需要 ffmpeg 合并，比 DASH 简单，优先用它。"""
+    href = f"https://www.facebook.com/watch/?v={video_id}"
+    endpoint = "https://www.facebook.com/plugins/video.php?href=" + quote(href, safe="") + "&show_text=false"
+    fetched = await _fetch_meta_html(endpoint, _META_UA, timeout=30.0)
+    sources: Dict[str, Optional[str]] = {"hd": None, "sd": None}
+    if fetched["kind"] != "ok":
+        return sources
+    for key, name in (("hd", "hd_src"), ("sd", "sd_src")):
+        match = re.search(r'"%s":"(https:(?:[^"\\]|\\.)*)"' % name, fetched["text"])
+        if match:
+            try:
+                sources[key] = json.loads('"' + match.group(1) + '"')
+            except ValueError:
+                continue
+    return sources
+
+
+def _fb_fetch_url(ref: Dict[str, str], original: str) -> str:
+    """规范化要抓的页面地址：一律 www.facebook.com（m. / mbasic. 会跳登录），去掉追踪参数。"""
+    kind = ref["kind"]
+    if kind in ("post", "video") and ref.get("path"):
+        return "https://www.facebook.com" + ref["path"].rstrip("/") + "/"
+    if kind == "video":
+        return f"https://www.facebook.com/watch/?v={ref['id']}"
+    if kind == "reel":
+        return f"https://www.facebook.com/reel/{ref['id']}"
+    if kind == "watch":
+        return f"https://www.facebook.com/watch/?v={ref['id']}"
+    if kind == "photo" and ref.get("path"):
+        return "https://www.facebook.com" + ref["path"]
+    if kind == "photo":
+        return f"https://www.facebook.com/photo.php?fbid={ref['id']}"
+    if kind == "permalink":
+        if ref.get("id"):
+            return f"https://www.facebook.com/{ref['id']}/posts/{ref['story_fbid']}"
+        return f"https://www.facebook.com/permalink.php?story_fbid={ref['story_fbid']}"
+    if kind == "share":
+        sub = f"{ref['sub']}/" if ref.get("sub") else ""
+        return f"https://www.facebook.com/share/{sub}{ref['code']}/"
+    return original
+
+
+def _fb_login_message(what: str = "这条 Facebook 内容") -> str:
+    return (
+        f"{what}需要登录才能查看：可能是私密 / 仅好友可见、年龄或地区受限，或这种链接形态（photo.php、permalink.php 等）匿名拿不到。"
+        "本插件不登录；请发 /<主页>/posts/<id> 形式的公开帖子链接。"
+    )
+
+
+async def _fb_resolve_fallbacks(ref: Dict[str, str], fetch_url: str) -> Optional[Dict[str, Any]]:
+    """主页面不可用时的回退：plugins/post.php（文字 + 小图 + 计数）；视频类链接再加 plugins/video.php 取视频。"""
+    parsed: Optional[Dict[str, Any]] = None
+    endpoint = "https://www.facebook.com/plugins/post.php?href=" + quote(fetch_url, safe="") + "&show_text=true&width=500"
+    fetched = await _fetch_meta_html(endpoint, _META_UA, timeout=30.0)
+    if fetched["kind"] == "ok":
+        candidate = await asyncio.to_thread(_fb_parse_plugin_post, fetched["text"])
+        if candidate.get("text") or candidate.get("items"):
+            parsed = candidate
+    video_id = ref.get("id") if ref["kind"] in ("video", "reel", "watch") else None
+    if video_id:
+        parsed = parsed or {
+            "author": None, "text": None, "created": None, "reactions": None, "comments": None, "shares": None,
+            "items": [], "comments_sample": [], "source": "plugins/video.php",
+        }
+        if not any(item.get("type") == "video" for item in parsed["items"]):
+            parsed["items"].append({"type": "video", "id": video_id})
+    return parsed
+
+
+async def _fb_build_resolved(parsed: Dict[str, Any], canonical: str) -> Dict[str, Any]:
+    items = parsed.get("items") or []
+    image_list: List[str] = []
+    fallbacks: Dict[str, str] = {}
+    cover: Optional[str] = None
+    for item in items:
+        if item.get("type") != "image" or not item.get("url"):
+            continue
+        best = item.get("url_full") or item["url"]
+        image_list.append(best)
+        cover = cover or best
+        if best != item["url"]:
+            fallbacks[best] = item["url"]  # 去掉 ctp 的链接失败时回退原 URL
+    video_items = [item for item in items if item.get("type") == "video"][:_META_MAX_VIDEOS]
+    sources = await asyncio.gather(*(_fb_video_sources(str(item["id"])) for item in video_items)) if video_items else []
+    videos: List[Dict[str, Any]] = []
+    for item, source in zip(video_items, sources):
+        progressive = source.get("hd") or source.get("sd")
+        if not progressive and not item.get("dash_video_url"):
+            continue
+        height = item.get("height")
+        label = item.get("label") or (f"{height}p" if height else ("HD" if source.get("hd") else "SD"))
+        videos.append({
+            "label": str(label),
+            "url": progressive,
+            "size": None,
+            "width": item.get("width") or None,
+            "height": height or None,
+            "id": item.get("id"),
+            "dash_video_url": item.get("dash_video_url"),
+            "dash_audio_url": item.get("dash_audio_url"),
+        })
+    created = parsed.get("created")
+    link = parsed.get("link") or None
+    return {
+        "ok": True,
+        "platform": "facebook",
+        "mode": "direct_url",
+        "source": parsed.get("source"),
+        "note_id": str(parsed.get("post_id") or ""),
+        "title": str(parsed.get("text") or "").strip(),
+        "text_truncated": bool(parsed.get("text_truncated")),
+        "author": str(parsed.get("author") or ""),
+        "screen_name": "",
+        "created_at": created,
+        "created_at_beijing": _x_beijing_time(created) if created else "",
+        "likes": parsed.get("reactions"),
+        "replies": parsed.get("comments"),
+        "shares": parsed.get("shares"),
+        "views": parsed.get("views"),
+        "canonical_url": canonical,
+        "cover": cover,
+        "videos": videos,
+        "video_total": len([item for item in items if item.get("type") == "video"]),
+        "image_list": image_list,
+        "image_fallbacks": fallbacks,
+        "link_attachment": link,
+        "comments_sample": parsed.get("comments_sample") or [],
+        "album_count": parsed.get("album_count"),
+    }
+
+
+async def _resolve_facebook(url: str) -> Dict[str, Any]:
+    """取 Facebook 公开帖子的作者 / 全文 / 时间 / 反应评论分享数 / 全部图片 / 视频（匿名，不登录）。
+
+    回退链：主页面 Relay 数据 → plugins/post.php（视频类链接再加 plugins/video.php）→ og 标签。
+    ``ok=False`` 且带 ``fallback=True`` 表示都没拿到、但属于暂时性失败，调用方可再试 yt-dlp。
+    """
+    ref = _facebook_ref(url)
+    if not ref:
+        return {"ok": False, "platform": "facebook", "error": f"没能从链接里认出 Facebook 帖子（链接：{str(url)[:100]}）。"}
+    if ref["kind"] == "fbwatch":
+        return {"ok": False, "platform": "facebook", "error": "暂不支持 fb.watch 短链，请发完整链接（在 Facebook 里点「复制链接」拿 facebook.com 开头的那条）。"}
+    if ref["kind"] == "group":
+        return {"ok": False, "platform": "facebook", "error": "Facebook 群组帖子通常需要登录才能查看，本插件不使用登录态，暂不支持。"}
+
+    fetch_url = _fb_fetch_url(ref, url)
+    fetched = await _fetch_meta_html(fetch_url, _META_UA, timeout=40.0)
+    kind = fetched["kind"]
+    page_data: Optional[Dict[str, Any]] = None
+    if kind == "ok":
+        page_data = await asyncio.to_thread(_fb_parse_page, fetched["text"])
+        if page_data.get("source") == "og-only":
+            title = str(_meta_og(fetched["text"], "og:title") or "")
+            if re.search(r"log in|log into|sign up|ログイン|登录|登入", title, re.IGNORECASE) or not (page_data.get("text") or page_data["items"]):
+                page_data = None
+                kind = "login" if title else "missing"
+        elif not (page_data.get("text") or page_data["items"] or page_data.get("source")):
+            page_data = None
+            kind = "missing"
+    final_url = fetched.get("url") or fetch_url
+    if page_data is None:
+        plugin.logger.info(f"Facebook 主页面不可用（{kind}），回退 plugins/post.php：{fetch_url}")
+        page_data = await _fb_resolve_fallbacks(ref, final_url if kind != "login" else fetch_url)
+        if page_data is None:
+            if kind == "login":
+                return {"ok": False, "platform": "facebook", "error": _fb_login_message()}
+            if kind == "missing":
+                return {"ok": False, "platform": "facebook", "error": "没有找到这条 Facebook 内容：链接可能已失效、帖子已删除，或不是公开的。"}
+            return {
+                "ok": False,
+                "platform": "facebook",
+                "fallback": True,
+                "error": f"Facebook 暂时没有给出这条内容的数据（{fetched.get('error') or kind}）（也可能是帖子已删除、或 Facebook 限流了这个 IP，稍后再试）。",
+            }
+    canonical = final_url if ref["kind"] != "share" else (page_data.get("permalink") or final_url)
+    resolved = await _fb_build_resolved(page_data, canonical)
+    if not resolved["videos"] and not resolved["image_list"] and not resolved["title"] and not resolved["link_attachment"]:
+        return {"ok": False, "platform": "facebook", "fallback": True, "error": "Facebook 返回的页面里没有可用的文字、图片或视频。"}
+    return resolved
+
+
+def _format_fb_caption(resolved: Dict[str, Any], kind: str, with_comments: bool = False) -> str:
+    author = str(resolved.get("author") or "").strip()
+    when = str(resolved.get("created_at_beijing") or "")
+    meta = [part for part in (author, f"{when}（北京时间）" if when else "") if part]
+    lines = [f"Facebook 帖子 · {kind}"]
+    if meta:
+        lines.append(" · ".join(meta))
+    stats = []
+    for key, label in (("likes", "反应"), ("replies", "评论"), ("shares", "分享"), ("views", "观看")):
+        if resolved.get(key) is not None:
+            stats.append(f"{label} {resolved[key]}")
+    if stats:
+        lines.append(" · ".join(stats))
+    body = str(resolved.get("title") or "").strip()
+    if body:
+        lines.append("")
+        lines.append(_meta_trim(body))
+        if len(body) > _META_MAX_TEXT_CHARS:
+            lines.append("（正文过长，已截断，完整内容请看原帖）")
+        elif resolved.get("text_truncated"):
+            lines.append("（只取到了分享预览里的文字，可能不完整，完整内容请看原帖）")
+    link = resolved.get("link_attachment") or None
+    if link and (link.get("title") or link.get("url")):
+        lines.append("")
+        lines.append("🔗 " + " ".join(part for part in (str(link.get("title") or ""), str(link.get("url") or "")) if part))
+    if with_comments and resolved.get("comments_sample"):
+        lines.append("")
+        lines.append(f"—— 前 {len(resolved['comments_sample'])} 条评论 ——")
+        for comment in resolved["comments_sample"]:
+            text = str(comment.get("text") or "").replace("\n", " ").strip()
+            lines.append(f"{comment.get('author') or '匿名'}：{text[:200]}")
+    if resolved.get("note"):
+        lines.append("")
+        lines.append(str(resolved["note"]))
+    lines.append("")
+    lines.append(f"链接：{resolved.get('canonical_url') or ''}")
+    return "\n".join(lines)
+
+
+async def _download_fb_dash(entry: Dict[str, Any], task_dir: Path, max_bytes: int) -> Path:
+    """DASH 备用路径：下视频流 + 音频流，再用 ffmpeg 无损合并（沿用 B 站的 ffmpeg 调用方式）。"""
+    video_url = str(entry.get("dash_video_url") or "")
+    audio_url = str(entry.get("dash_audio_url") or "")
+    if not video_url:
+        raise RuntimeError("Facebook 没有给出可用的视频地址")
+    headers = {"User-Agent": _META_UA, "Referer": _DOWNLOAD_REFERER["facebook"], "Accept": "*/*"}
+    proxy = _meta_proxy("facebook")
+    video_file = await _download_direct(video_url, task_dir / "video.m4s", max_bytes, headers, proxy)
+    if not audio_url:
+        return video_file  # 没有音轨的视频（动图类）直接发
+    ffmpeg = _bilibili_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("没有可用的 ffmpeg（无法合并 DASH 音视频）")
+    audio_file = await _download_direct(audio_url, task_dir / "audio.m4s", max_bytes, headers, proxy)
+    if video_file.stat().st_size + audio_file.stat().st_size > max_bytes:
+        raise RuntimeError(f"Facebook 视频合并前总体积超过 {_human_size(max_bytes)} 上限，未发送。")
+    output = task_dir / "video.mp4"
+    process = await asyncio.create_subprocess_exec(
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", str(video_file), "-i", str(audio_file),
+        "-c", "copy", "-movflags", "+faststart", str(output),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(process.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        raise RuntimeError("ffmpeg 合并超时（视频过大）") from None
+    if process.returncode != 0 or not output.exists() or output.stat().st_size == 0:
+        detail = (stderr or b"").decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError(f"ffmpeg 合并失败：{detail[-1][:200] if detail else '未知错误'}")
+    return output
+
+
+async def _download_meta_video(
+    entry: Dict[str, Any], platform: str, resolved: Dict[str, Any], task_dir: Path, max_bytes: int
+) -> "_MediaSource":
+    """下载一个视频：优先单文件直链；Facebook 直链失败或没有时再走 DASH + ffmpeg。"""
+    task_dir.mkdir(parents=True, exist_ok=True)
+    error: Optional[Exception] = None
+    if entry.get("url"):
+        try:
+            return await _download_resolved({**resolved, "videos": [entry]}, platform, task_dir, max_bytes)
+        except Exception as exc:  # noqa: BLE001 - FB 还有 DASH 可以试
+            error = exc
+            if platform != "facebook" or not entry.get("dash_video_url"):
+                raise
+            plugin.logger.warning(f"Facebook 单文件视频下载失败，改走 DASH：{exc}")
+    if platform == "facebook" and entry.get("dash_video_url"):
+        try:
+            merged = await _download_fb_dash(entry, task_dir, max_bytes)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"Facebook 视频下载失败：{error or ''}{exc}") from exc
+        return _MediaSource(name=f"Facebook-{entry.get('id') or resolved.get('note_id') or int(time.time())}.mp4", path=merged, size=merged.stat().st_size)
+    raise RuntimeError(f"{_PLATFORM_NAMES.get(platform, platform)}没有可用的视频直链")
+
+
+async def _obtain_meta_post(
+    resolved: Dict[str, Any], platform: str, task_dir: Path, limit: int, formatter: Any
+) -> "_MediaSource":
+    """IG / FB 的公共收尾：挑图片（受 max_images 限制）、下载视频（最多 _META_MAX_VIDEOS 个）、拼文字节点。"""
+    config = plugin.get_config()
+    images = [str(item) for item in (resolved.get("image_list") or []) if item]
+    max_images = max(1, int(getattr(config, "max_images", 9) or 9))
+    picked_images = images[:max_images]
+    videos = [item for item in (resolved.get("videos") or []) if isinstance(item, dict)][:_META_MAX_VIDEOS]
+    total_videos = max(len(resolved.get("videos") or []), int(resolved.get("video_total") or 0))
+    kind = _meta_post_kind({**resolved, "videos": videos[:total_videos]}, len(picked_images))
+    if platform == "facebook":
+        caption = formatter(resolved, kind, bool(getattr(config, "facebook_send_comments", False)))
+    else:
+        caption = formatter(resolved, kind)
+    if len(images) > len(picked_images):
+        caption += f"\n（共 {len(images)} 张图片，仅发送前 {len(picked_images)} 张）"
+    if total_videos > len(videos):
+        caption += f"\n（共 {total_videos} 个视频，仅发送前 {len(videos)} 个）"
+    name_prefix = _PLATFORM_NAMES.get(platform, platform)
+    source = _MediaSource(name=f"{name_prefix}-{resolved.get('note_id') or int(time.time())}", caption=caption)
+    if picked_images:
+        source.images = tuple(picked_images)
+        source.image_fallbacks = {
+            key: value for key, value in (resolved.get("image_fallbacks") or {}).items() if key in set(picked_images)
+        }
+        plugin.logger.info(f"{name_prefix}图片：共 {len(images)} 张，本次发送 {len(picked_images)} 张")
+    downloaded: List["_MediaSource"] = []
+    for index, entry in enumerate(videos):
+        downloaded.append(await _download_meta_video(entry, platform, resolved, task_dir / f"video-{index + 1}", limit))
+    if downloaded:
+        source.name = downloaded[0].name
+        source.path = downloaded[0].path
+        source.size = downloaded[0].size
+        source.extra_videos = tuple((item.path, item.name) for item in downloaded[1:])
+    return source
+
+
+async def _obtain_facebook(url: str, task_dir: Path) -> "_MediaSource":
+    """Facebook 帖子 → 可发送内容：视频（单文件直链优先，DASH + ffmpeg 备用）、图片组、文字。
+    暂时性失败时回退 yt-dlp（只能拿视频，没有正文）。"""
+    config = plugin.get_config()
+    limit = int(getattr(config, "facebook_max_size_mb", 100) or 100) * 1024 * 1024
+    try:
+        resolved = await _resolve_facebook(url)
+    except Exception as error:  # noqa: BLE001
+        plugin.logger.warning(f"Facebook 解析异常：{error}")
+        resolved = {"ok": False, "platform": "facebook", "fallback": True, "error": f"Facebook 解析失败：{error}"}
+    if resolved.get("ok"):
+        return await _obtain_meta_post(resolved, "facebook", task_dir, limit, _format_fb_caption)
+    message = str(resolved.get("error") or "Facebook 解析失败")
+    if not resolved.get("fallback"):
+        raise RuntimeError(message)
+    plugin.logger.warning(f"{message} 回退 yt-dlp")
+    try:
+        video, name = await _run_ytdlp(url, task_dir, _meta_proxy("facebook"))
+    except Exception as error:  # noqa: BLE001 - 两边的原因一起报给用户
+        raise RuntimeError(f"{message}yt-dlp 回退也失败：{error}") from error
+    return _MediaSource(name=name, path=video, size=video.stat().st_size)
+
+
 async def _obtain_video(url: str, task_dir: Path) -> "_MediaSource":
     """拿到可发送的视频。
 
@@ -1536,6 +2868,7 @@ async def _obtain_video(url: str, task_dir: Path) -> "_MediaSource":
     - TikTok：大陆直连被墙、云端完全不可达，所以由**本机**解析器走代理下好文件，
       这里只拿到一个本机路径，直接交给同机的 NapCat 上传（不经过服务器）
     - X：公开 syndication 接口取正文 / 图片 / 视频直链（见 _obtain_x，接口不可用时回退 yt-dlp）
+    - Instagram / Facebook：匿名读公开帖子页（见 _obtain_instagram / _obtain_facebook，失败时回退 yt-dlp / oEmbed）
     - 其它平台：yt-dlp 下载
 
     只有在**解析**这一步不可用（解析器离线 / 超时 / 解析失败）时，小红书才回退 yt-dlp；
@@ -1548,6 +2881,12 @@ async def _obtain_video(url: str, task_dir: Path) -> "_MediaSource":
     # X：公开嵌入接口，不需要本地解析器
     if _is_x(url):
         return await _obtain_x(url, task_dir)
+
+    # Instagram / Facebook：匿名读公开帖子页，不需要本地解析器
+    if _is_instagram(url):
+        return await _obtain_instagram(url, task_dir)
+    if _is_facebook(url):
+        return await _obtain_facebook(url, task_dir)
 
     # B 站：走公开 API；有 ffmpeg 时用 DASH 拿 1080p/4K 并合并，否则退回单文件 mp4（匿名 720p）
     if _is_bilibili(url):
@@ -1677,7 +3016,7 @@ async def _download_resolved(
         )
 
     headers = {
-        "User-Agent": _DOWNLOAD_UA,
+        "User-Agent": _download_ua(platform),
         "Referer": _DOWNLOAD_REFERER.get(platform, "https://www.douyin.com/"),
         "Accept": "*/*",
     }
@@ -1687,7 +3026,9 @@ async def _download_resolved(
         f"体积={_human_size(picked.get('size'))}"
     )
     try:
-        video = await _download_direct(str(picked["url"]), task_dir / "video.mp4", max_bytes, headers)
+        video = await _download_direct(
+            str(picked["url"]), task_dir / "video.mp4", max_bytes, headers, _meta_proxy(platform)
+        )
     except Exception as error:  # noqa: BLE001 - 直链过期 / CDN 拒绝时给出可读提示
         raise RuntimeError(f"{source_name}直链下载失败：{error}") from error
     label = str(picked.get("label") or platform)
@@ -1721,6 +3062,7 @@ async def _send_forward(
     source_url: str,
     images: Optional[list] = None,
     caption: str = "",
+    extra_videos: Optional[list] = None,
 ) -> None:
     """把视频或图文以合并转发发出。
 
@@ -1728,7 +3070,7 @@ async def _send_forward(
     也可以是 NapCat 所在机器上的本地文件路径（TikTok 用这种）。
     ``images`` 非空时改为发图片组（图文笔记），每个节点放一张图。
     ``caption`` 非空时作为最前面的文字节点（X 帖子正文等），替代默认的「平台 + 链接」抬头；
-    图片和视频都有时（混合帖子）先发图片再发视频；两者都没有就只发文字（纯文字帖子）。
+    图片和视频都有时（混合帖子）先发图片再发视频（``extra_videos`` 是同帖的其它视频）；两者都没有就只发文字（纯文字帖子）。
     """
     kind, target = _target(ctx)
     source = _source_name(source_url)
@@ -1738,6 +3080,9 @@ async def _send_forward(
             content.append({"type": "image", "data": {"file": reference}})
         if file_ref:
             content.append({"type": "video", "data": {"file": file_ref, "name": name}})
+        # 同一条帖子里的其它视频（Instagram 轮播 / Facebook 相册）：(临时链接, 文件名)
+        for extra_ref, extra_name in extra_videos or []:
+            content.append({"type": "video", "data": {"file": extra_ref, "name": extra_name}})
     elif images:
         content = [{
             "type": "text",
@@ -1800,19 +3145,40 @@ async def _process(ctx: AgentCtx, url: str) -> str:
             referer = _DOWNLOAD_REFERER.get(
                 _download_platform(url) or "xiaohongshu", "https://www.xiaohongshu.com/"
             )
-            headers = {"User-Agent": _DOWNLOAD_UA, "Referer": referer, "Accept": "*/*"}
+            headers = {"User-Agent": _download_ua(_download_platform(url)), "Referer": referer, "Accept": "*/*"}
             max_bytes = int(plugin.get_config().max_file_size_mb) * 1024 * 1024
+            meta_platform = _is_instagram(url) or _is_facebook(url)
+            image_proxy = _meta_proxy(_download_platform(url))
             refs: list = []
             for index, image_url in enumerate(source.images, start=1):
-                image_path = await _download_direct(
-                    image_url, task_dir / f"image-{index:02d}.jpg", max_bytes, headers
-                )
-                refs.append(_lease_url(image_path, f"{source.name}-{index:02d}.jpg"))
+                try:
+                    image_path = await _download_direct(
+                        image_url, task_dir / f"image-{index:02d}.jpg", max_bytes, headers, image_proxy
+                    )
+                except Exception as error:  # noqa: BLE001 - 有备用链接（缩放参数 / 小图）时先试备用
+                    backup = (source.image_fallbacks or {}).get(image_url)
+                    if not backup:
+                        raise
+                    plugin.logger.warning(f"图片 {index} 下载失败（{error}），改用备用链接")
+                    image_path = await _download_direct(
+                        backup, task_dir / f"image-{index:02d}.jpg", max_bytes, headers, image_proxy
+                    )
+                image_name = f"{source.name}-{index:02d}.jpg"
+                if meta_platform:
+                    # Instagram / Facebook 的 CDN 可能给 webp / png：按文件头改成真实扩展名
+                    with image_path.open("rb") as handle:
+                        extension = _meta_sniff_ext(handle.read(16))
+                    if extension != ".jpg":
+                        image_path = image_path.rename(image_path.with_suffix(extension))
+                        image_name = f"{source.name}-{index:02d}{extension}"
+                refs.append(_lease_url(image_path, image_name))
             plugin.logger.info(f"{_source_name(url)}图文发送：{len(refs)} 张（{source.name}）")
             # 混合帖子（图片 + 视频 / 动图）：视频也交给同一条合并转发
             video_ref = _lease_url(source.path, source.name) if source.path else None
+            extra_refs = [(_lease_url(path, name), name) for path, name in source.extra_videos]
             await _send_forward(
-                ctx, video_ref, source.name, url, images=refs, caption=source.caption
+                ctx, video_ref, source.name, url, images=refs, caption=source.caption,
+                extra_videos=extra_refs,
             )
             _RECENT_URLS[key] = time.time() + 30 * 60
             if video_ref:
@@ -1833,7 +3199,10 @@ async def _process(ctx: AgentCtx, url: str) -> str:
             if source.path is None:
                 raise RuntimeError("没有拿到可发送的视频文件")
             file_ref = _lease_url(source.path, source.name)
-        await _send_forward(ctx, file_ref, source.name, url, caption=source.caption)
+        extra_refs = [(_lease_url(path, name), name) for path, name in source.extra_videos]
+        await _send_forward(
+            ctx, file_ref, source.name, url, caption=source.caption, extra_videos=extra_refs
+        )
         _RECENT_URLS[key] = time.time() + 30 * 60
         return "视频已通过合并转发发回原聊天。"
     except Exception as error:
@@ -1860,13 +3229,13 @@ async def auto_forward_video(ctx: AgentCtx, message: ChatMessage) -> MsgSignal |
 @plugin.mount_sandbox_method(
     SandboxMethodType.BEHAVIOR,
     name="解析并合并转发短视频",
-    description="下载公开的抖音、小红书、TikTok、B站视频和 X (Twitter) 帖子（文字 + 图片 / 视频）链接，并以 QQ 合并转发发送到当前聊天。不支持付费、私密或受保护内容。",
+    description="下载公开的抖音、小红书、TikTok、B站视频，以及 X (Twitter) / Instagram / Facebook 帖子（文字 + 图片 / 视频）链接，并以 QQ 合并转发发送到当前聊天。不支持付费、私密或受保护内容。",
 )
 async def forward_video(ctx: AgentCtx, url: str) -> str:
-    """当用户明确要求解析短视频时调用；参数必须是公开的抖音、小红书、TikTok、B站 或 X 帖子链接。"""
+    """当用户明确要求解析短视频时调用；参数必须是公开的抖音、小红书、TikTok、B站，或 X / Instagram / Facebook 帖子链接。"""
     candidate = _find_supported_url(url)
     if not candidate:
-        return "只支持公开的抖音、小红书、TikTok、B站 视频和 X 帖子链接。"
+        return "只支持公开的抖音、小红书、TikTok、B站 视频和 X / Instagram / Facebook 帖子链接。"
     return await _process(ctx, candidate)
 
 
@@ -1911,8 +3280,8 @@ def create_router() -> APIRouter:
         """Small deployment check; it exposes no configuration or media."""
         return {
             "name": "video_forward",
-            "version": "0.10.0",
-            "supported": ["douyin", "xiaohongshu", "tiktok", "bilibili", "x"],
+            "version": "0.11.0",
+            "supported": ["douyin", "xiaohongshu", "tiktok", "bilibili", "x", "instagram", "facebook"],
             "bilibili": {
                 "cookie": bool(
                     str(getattr(plugin.get_config(), "bilibili_cookie", "") or "").strip()
@@ -1929,6 +3298,21 @@ def create_router() -> APIRouter:
                 "source": "cdn.syndication.twimg.com（公开嵌入接口，无需登录 / token）",
                 "max_size_mb": int(getattr(plugin.get_config(), "x_max_size_mb", 100) or 100),
                 "send_text": bool(getattr(plugin.get_config(), "x_send_text", True)),
+            },
+            "instagram": {
+                "enabled": _meta_enabled("instagram_enabled"),
+                "source": "instagram.com 公开帖子页（匿名，非官方接口，无需登录 / token）",
+                "max_size_mb": int(getattr(plugin.get_config(), "instagram_max_size_mb", 100) or 100),
+                "fallback_ua": bool(getattr(plugin.get_config(), "instagram_fallback_ua", True)),
+                "proxy_configured": bool(_meta_proxy("instagram")),
+            },
+            "facebook": {
+                "enabled": _meta_enabled("facebook_enabled"),
+                "source": "facebook.com 公开帖子页（匿名，非官方接口，无需登录 / token）",
+                "max_size_mb": int(getattr(plugin.get_config(), "facebook_max_size_mb", 100) or 100),
+                "send_comments": bool(getattr(plugin.get_config(), "facebook_send_comments", False)),
+                "proxy_configured": bool(_meta_proxy("facebook")),
+                "ffmpeg": bool(_bilibili_ffmpeg()),
             },
             "resolver": {
                 "enabled": bool(plugin.get_config().resolver_enabled),
@@ -2004,9 +3388,21 @@ def create_router() -> APIRouter:
                 resolved = await _resolve_x(target_url)
             except Exception as error:  # noqa: BLE001 - 自检需要看到原始错误
                 return {"ok": False, "error": str(error)}
+        elif _is_instagram(target_url):
+            # Instagram：匿名读公开帖子页（不需要本地解析器）
+            try:
+                resolved = await _resolve_instagram(target_url)
+            except Exception as error:  # noqa: BLE001 - 自检需要看到原始错误
+                return {"ok": False, "error": str(error)}
+        elif _is_facebook(target_url):
+            # Facebook：同上
+            try:
+                resolved = await _resolve_facebook(target_url)
+            except Exception as error:  # noqa: BLE001 - 自检需要看到原始错误
+                return {"ok": False, "error": str(error)}
         else:
             if not _needs_local_resolver(target_url):
-                return {"ok": False, "error": "自检只支持 抖音 / 小红书 / TikTok / B站 / X 链接"}
+                return {"ok": False, "error": "自检只支持 抖音 / 小红书 / TikTok / B站 / X / Instagram / Facebook 链接"}
             if not _resolver_online():
                 return {"ok": False, "error": "本地解析器未连接（没有收到心跳）"}
             try:
@@ -2048,6 +3444,44 @@ def create_router() -> APIRouter:
                         "TikTok 需要解析器先上传：请把 media-resolver 更新到带上传能力的版本并重启它；"
                         "若两者其实是同一台机器，请在插件配置里打开「允许直接用解析器的本机路径」。"
                     )
+            return report
+        if download and resolved.get("ok") and resolved.get("platform") in ("instagram", "facebook"):
+            # Instagram / Facebook：第一张图和第一个视频都真下载（直链会过期，所以解析完马上下）
+            platform_key = str(resolved["platform"])
+            limit_name = f"{platform_key}_max_size_mb"
+            max_bytes = int(getattr(plugin.get_config(), limit_name, 100) or 100) * 1024 * 1024
+            task_dir = _VIDEO_DIR / f"selftest-meta-{int(time.time())}"
+            task_dir.mkdir(parents=True, exist_ok=True)
+            headers = {
+                "User-Agent": _download_ua(platform_key),
+                "Referer": _DOWNLOAD_REFERER[platform_key],
+                "Accept": "*/*",
+            }
+            test_proxy = _meta_proxy(platform_key)
+            try:
+                images = resolved.get("image_list") or []
+                if images:
+                    try:
+                        image = await _download_direct(
+                            str(images[0]), task_dir / "image-01.jpg", max_bytes, headers, test_proxy
+                        )
+                    except Exception:  # noqa: BLE001 - 与正式流程一致：有备用链接就试备用
+                        backup = (resolved.get("image_fallbacks") or {}).get(images[0])
+                        if not backup:
+                            raise
+                        image = await _download_direct(backup, task_dir / "image-01.jpg", max_bytes, headers, test_proxy)
+                        report["first_image_used_fallback"] = True
+                    report["first_image_mb"] = round(image.stat().st_size / 1048576, 2)
+                if resolved.get("videos"):
+                    downloaded = await _download_meta_video(
+                        resolved["videos"][0], platform_key, resolved, task_dir / "video-1", max_bytes
+                    )
+                    report["downloaded_mb"] = round((downloaded.size or 0) / 1048576, 2)
+            except Exception as error:  # noqa: BLE001 - 自检要把错误原样报出来
+                report["ok"] = False
+                report["error"] = f"下载失败：{error}"
+            finally:
+                shutil.rmtree(task_dir, ignore_errors=True)
             return report
         if download and resolved.get("ok") and (resolved.get("image_list") or []):
             # 图文笔记：只验证第一张能否下载，足以证明图片链路可用

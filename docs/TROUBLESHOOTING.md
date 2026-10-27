@@ -134,3 +134,47 @@ curl -s -A "Mozilla/5.0" "https://cdn.syndication.twimg.com/tweet-result?id=<ID>
 返回 404（HTML「Nothing to see here」）= 帖子不存在 / 已删 / 受保护；服务器上这条能通而插件仍失败，再看日志里的
 `X 公开数据接口暂时不可用`、`X 直链下载失败` 等关键字。也可以用 `/resolver/self-test?token=<密钥>&url=<X 帖子链接>&download=true`
 验证「解析 → 下载」。
+
+---
+
+## 10. Instagram / Facebook 帖子发不出来 / 提示「无法解析」
+
+Instagram 和 Facebook 走的都是**匿名读公开帖子页**：插件默认用诚实的 `nekro-media-forward/1.0` User-Agent（不冒充浏览器；Instagram 唯一的例外见下面的「灰色做法」）
+请求帖子页，解析页面里内嵌的 JSON，**不登录、不用 Cookie / token、不需要本地解析器**。所以：
+
+- **这是非官方做法，随时可能失效**：Meta 改页面结构、加强限流 / 风控、或不再给匿名客户端返回数据，插件都会跟着失败。
+  失败时报错里会写出每条回退路径各自的原因（Instagram：页面 → embed 页 → yt-dlp → oEmbed；Facebook：帖子页 → `plugins/post.php` → `plugins/video.php` → yt-dlp）。
+- **签名的 CDN 链接会过期**（Instagram `oe=` / Facebook `oe=` 之类的参数），所以插件解析后立刻下载；如果解析和下载之间隔了很久（例如被限流重试）
+  可能遇到 HTTP 403，重发一次链接即可。
+- **灰色做法**：`instagram_fallback_ua`（**默认 `true`，开启**）——总是先用诚实 UA 请求；只有它拿不到数据（Instagram 页面是 JS 空壳）时，
+  才会再用 Googlebot 的 User-Agent 重试一次，成功时日志 / 自检里的来源会标成 `page(Googlebot UA)`。
+  这属于伪装成搜索引擎爬虫的灰色做法，可能不符合 Instagram 的使用条款，也可能随时被封；介意就把它设为 `false` 关闭
+  （关闭后只用诚实 UA，失败走 embed → yt-dlp → oEmbed 回退）。被带去登录页时不会换 UA 硬试。Facebook 没有任何 UA 伪装。
+  **不要**换成浏览器 UA：实测 Facebook 对浏览器 UA 直接返回 HTTP 400，Instagram 返回一个没有数据的 JS 壳页面。
+- **不支持**（会给出明确中文提示）：Instagram Stories / 高亮；私密账号和仅好友可见的帖子；需要登录的内容（年龄 / 地区限制）；
+  Facebook 群组帖（`/groups/.../posts/...`）；**`fb.watch` 短链**（请在 Facebook 里「复制链接」发 `facebook.com` 开头的完整链接，
+  报错就是「暂不支持 fb.watch 短链，请发完整链接」）；`m.facebook.com` / `photo.php` / `permalink.php` 匿名常被带去登录页。
+  插件**不会**也不应该去绕过这些限制。
+- **代理**：大陆机房多半直连不通这两个站，可配置 `instagram_proxy` / `facebook_proxy`（做法同 `x_proxy`，如 `http://172.18.0.1:7891`；
+  容器里的 `127.0.0.1` 是容器自己，要填宿主机在 docker 网桥上的地址）。留空 = 直连，行为和以前一样；两项互相独立，**不会借用 `x_proxy`**。
+  配置后，该站点的帖子页请求、图片 / 视频下载、yt-dlp 回退都会走它。注意：代理这条路径只做过离线验证（确认代理参数传给了 httpx / yt-dlp），
+  **没有用真实代理、也没有在大陆网络下实测过**；如果配了代理仍失败，先用 `curl -x <代理> -A "nekro-media-forward/1.0" https://www.instagram.com/p/<code>/` 看代理本身通不通。
+- **中国大陆 IP 未测试**：以上能力都是在海外机房 IP 直连下验证的。
+  机房 IP 被 Meta 限流时会看到 HTTP 429 / 500 / 空响应，插件会重试几次，仍失败就走回退；这时换个出口 IP 或稍后再试。
+- Instagram 混合轮播（图片 + 视频）会先发所有图片再发视频，原有顺序不保留；图片数量受 `max_images` 限制，单个视频超过
+  `instagram_max_size_mb` / `facebook_max_size_mb`（默认 100MB）不发送并提示实际大小。
+- Facebook 视频优先用单文件 mp4；它不可用时才用 DASH 视频流 + 音频流并**用 ffmpeg 合并**（需要服务器上有 ffmpeg，
+  路径同 `bilibili_ffmpeg_path`，留空自动查找）。缺 ffmpeg 时会提示。
+- 想关掉：`instagram_enabled: false` / `facebook_enabled: false`，对应链接会被忽略（机器人不会回应）。
+
+**快速自检**（把链接换成公开帖子；应返回 JSON，`ok` 为 `true`，并有 `image_count` / `video_count`）：
+
+```bash
+curl -s "http://<server>:8022/plugins/local_video.video_forward/resolver/self-test?token=<密钥>&url=<Instagram 或 Facebook 帖子链接>&download=true"
+```
+
+也可以手动看页面能不能匿名取到（诚实 UA；Facebook 返回 400 / Instagram 返回只有壳的页面，说明当前 IP 被限制了）：
+
+```bash
+curl -s -o /dev/null -w "%{http_code} %{size_download}\n" -A "nekro-media-forward/1.0 (+personal bot; non-browser)" -H "Accept: text/html" "https://www.instagram.com/p/<code>/"
+```

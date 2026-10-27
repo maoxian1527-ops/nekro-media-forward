@@ -741,7 +741,7 @@ class EndToEndProcess(unittest.TestCase):
         data = run(endpoint())
         self.assertIn("x", data["supported"])
         self.assertTrue(data["x"]["enabled"])
-        self.assertEqual(data["version"], "0.10.0")
+        self.assertEqual(data["version"], "0.11.0")
 
 
 if __name__ == "__main__":

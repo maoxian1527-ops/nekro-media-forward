@@ -53,6 +53,35 @@ x_send_text: true
 # 文字里是否带上点赞 / 回复数（仅 x_send_text 为 true 时有效）
 x_show_stats: true
 
+# Instagram 帖子解析：匿名读公开帖子页（不登录、不用 Cookie / token），非官方接口，可能随时失效
+# 支持 /p/ /reel/ /reels/ /tv/ 链接；Stories、私密账号、需登录的内容会提示无法解析
+instagram_enabled: true
+
+# Instagram 视频体积上限（MB）：单个视频超过则不发并提示实际大小
+instagram_max_size_mb: 100
+
+# 灰色做法（伪装成搜索引擎爬虫），默认开启，可设为 false 关闭：
+# 总是先用诚实的 nekro-media-forward UA；只有它拿不到数据（Instagram 偶尔只返回空壳）时，才会再用 Googlebot 的 User-Agent 重试一次。
+# 这可能不符合你所在地区 / Instagram 的使用条款，介意的话请改成 false（关闭后只用诚实 UA，失败就走 embed / yt-dlp / oEmbed 回退）
+instagram_fallback_ua: true
+
+# Facebook 帖子解析：匿名读公开帖子页（不登录、不用 Cookie / token），非官方接口，可能随时失效
+# 支持 /<主页>/posts/<id>、/videos/<id>、/reel/<id>、/watch/?v=、/share/p|v|r/ 等；不支持 fb.watch 短链、群组帖、私密内容
+facebook_enabled: true
+
+# Facebook 视频体积上限（MB）：单个视频超过则不发并提示实际大小
+facebook_max_size_mb: 100
+
+# 文字里是否附上最多 5 条页面上能匿名看到的热门评论（默认不附）
+facebook_send_comments: false
+
+# Instagram / Facebook 代理（可选，做法同 x_proxy）。
+# 留空 = 直连（和以前一样）。两个站在大陆机房大概率直连不通（作者没有在大陆网络下测过），需要时填各自的代理；
+# 帖子页请求、图片 / 视频下载、yt-dlp 回退都会走它。容器里的 127.0.0.1 是容器自己，要填宿主机在 docker 网桥上的地址，例如：
+# instagram_proxy: "http://172.18.0.1:7891"
+instagram_proxy: ""
+facebook_proxy: ""
+
 # NapCat 与解析器同一台机器时设为 true（TikTok 走本机路径直传，零中转）
 # NapCat 在云端时保持 false（改由解析器上传文件）
 allow_resolver_local_path: false
